@@ -1,0 +1,33 @@
+[package]
+name = "viralclip-swarm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Command-line argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Run external commands (yt-dlp, ffmpeg)
+which = "4.4"            # find executables in PATH
+tempfile = "3.8"         # create temporary directories
+
+# Audio processing
+hound = "3.5"            # WAV reading
+rustfft = "6.1"          # FFT for audio analysis
+symphonia = "0.5"        # audio decoding (alternative)
+
+# Progress bars
+indicatif = "0.17"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+env_logger = "0.10"
+
+# Serde for configuration (optional)
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+rayon = "1.7"

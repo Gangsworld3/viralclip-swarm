@@ -1,0 +1,4 @@
+target/ 
+.env 
+*.wav 
+*.srt 
