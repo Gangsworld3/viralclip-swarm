@@ -173,7 +173,7 @@ Tip: tune scoring
 #### •	Share example clips and workflows in the Discussions tab.
 #### •	Submit PRs for new detectors, UI components, or model integrations.
 # Maintainers
-#### •	Add maintainer contact and code of conduct link here.
+#### •	soon....
 
 ## License
 
