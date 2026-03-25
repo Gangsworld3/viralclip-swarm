@@ -1,5 +1,13 @@
-target/ 
+target/
+.idea/
 .vs/
-.env 
-*.wav 
-*.srt 
+.env
+*.wav
+*.srt
+
+# Generated outputs
+output/
+tests/output/
+
+# Local showcase/demo artifacts
+*.log
