@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 240" role="img" aria-labelledby="title desc">
+  <title id="title">ViralClip Swarm</title>
+  <desc id="desc">Angular orange and black logo mark with the ViralClip Swarm wordmark.</desc>
+  <rect width="960" height="240" fill="#f4efe7"/>
+  <g transform="translate(48 40)">
+    <rect x="0" y="0" width="160" height="160" rx="28" fill="#111111"/>
+    <path d="M34 108 L80 44 L126 108" fill="none" stroke="#ff6a00" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M52 124 L80 86 L108 124" fill="none" stroke="#ffd24d" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="80" cy="80" r="10" fill="#f4efe7"/>
+  </g>
+  <g fill="#111111">
+    <text x="250" y="112" font-family="Segoe UI, Arial, sans-serif" font-size="56" font-weight="800" letter-spacing="1">VIRALCLIP</text>
+    <text x="250" y="168" font-family="Segoe UI, Arial, sans-serif" font-size="50" font-weight="700" letter-spacing="6">SWARM</text>
+  </g>
+  <text x="252" y="205" fill="#5a534d" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600">
+    LOCAL-FIRST AI VIDEO CLIPPING FOR SHORT-FORM PLATFORMS
+  </text>
+</svg>

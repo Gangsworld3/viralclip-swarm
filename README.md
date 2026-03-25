@@ -1,5 +1,7 @@
 # ViralClip Swarm
 
+![ViralClip Swarm Logo](assets/logo.svg)
+
 Local-first Rust pipeline for turning long-form video into short-form clips, captions, vertical exports, and platform-ready metadata.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
@@ -33,6 +35,27 @@ For a larger local demo on the bundled source video, use:
 cargo run -- --config ".\showcase-config.json"
 ```
 
+## Demo Package
+
+Tracked demo assets live in [demo/README.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/README.md).
+
+Direct links:
+
+- [Collage preview](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/collage.jpg)
+- [Preview image 1](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/preview-1.jpg)
+- [Preview image 2](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/preview-2.jpg)
+- [Sample generated clip](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/sample-clip.mp4)
+- [Showcase instructions](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/SHOWCASE.md)
+- [Release summary](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/RELEASE_SUMMARY.md)
+
+## GitHub Setup
+
+Recommended GitHub metadata is documented in [docs/GITHUB_ABOUT.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/GITHUB_ABOUT.md).
+
+Recommended packaging notes are documented in [docs/PACKAGING.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/PACKAGING.md).
+
+Contribution guidance is documented in [CONTRIBUTING.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/CONTRIBUTING.md).
+
 ## Highlights
 
 - Local file or YouTube input
@@ -55,14 +78,15 @@ cargo run -- --config ".\showcase-config.json"
 
 ## Evidence
 
-The repo now contains a generated smoke showcase package under `output/showcase-smoke/`.
+The reproducible run outputs stay under `output/`, but the repository now includes curated proof assets under `demo/`.
 
-Use it to inspect:
+Use the tracked demo package to inspect:
 
-- whether clips are actually produced
-- whether export metadata matches the generated clip
-- whether the proof report metrics match the run outputs
-- whether the pipeline is reproducible from config
+- generated previews
+- a real sample clip
+- release-facing media that can be shown directly on GitHub
+
+Use `showcase-smoke.json` or `showcase-config.json` when you want to regenerate the full evidence package locally.
 
 ## Demo
 
