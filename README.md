@@ -192,7 +192,8 @@ cargo run -- --input "C:\path\video.mp4" --crop --crop-mode face --num-clips 5 -
 ### AI Storyboard
 
 ```powershell
-cargo run -- --input "C:\path\video.mp4" --llm-enable --llm-provider heuristic
+$env:HF_TOKEN="..."
+cargo run -- --input "C:\path\video.mp4" --llm-enable --llm-provider huggingface --llm-model "moonshotai/Kimi-K2-Instruct-0905" --llm-api-key-env HF_TOKEN
 ```
 
 ### Config-Driven Run
@@ -324,6 +325,9 @@ Providers:
 - `heuristic`
 - `local`
 - `openai`
+- `openrouter`
+- `groq`
+- `huggingface`
 - `anthropic`
 - `gemini`
 
@@ -333,6 +337,17 @@ Relevant flags:
 - `--llm-model <MODEL>`
 - `--llm-api-key-env <ENV_VAR>`
 - `--llm-output <PATH>`
+
+For low-cost or free-tier demos, the recommended default is:
+
+- `huggingface` with `HF_TOKEN`
+
+Other good demo options:
+
+- `openrouter` with `OPENROUTER_API_KEY`
+- `groq` with `GROQ_API_KEY`
+
+If no working token is present, the pipeline falls back to the local heuristic path.
 
 ### Export Bundles
 
@@ -385,6 +400,27 @@ cargo run -- --input "C:\clips\stream.mp4" --captions --transcription-provider l
 
 ```powershell
 cargo run -- --input "C:\clips\stream.mp4" --captions --transcription-provider openai --cloud-transcription-model whisper-1 --llm-enable --llm-provider openai --llm-model gpt-4o-mini
+```
+
+### Hugging Face Demo Metadata
+
+```powershell
+$env:HF_TOKEN="..."
+cargo run -- --input "C:\clips\stream.mp4" --llm-enable --llm-provider huggingface --llm-model "moonshotai/Kimi-K2-Instruct-0905" --llm-api-key-env HF_TOKEN
+```
+
+### Groq Demo Metadata
+
+```powershell
+$env:GROQ_API_KEY="..."
+cargo run -- --input "C:\clips\stream.mp4" --llm-enable --llm-provider groq --llm-model "llama-3.3-70b-versatile" --llm-api-key-env GROQ_API_KEY
+```
+
+### OpenRouter Demo Metadata
+
+```powershell
+$env:OPENROUTER_API_KEY="..."
+cargo run -- --input "C:\clips\stream.mp4" --llm-enable --llm-provider openrouter --llm-model "openai/gpt-4o-mini" --llm-api-key-env OPENROUTER_API_KEY
 ```
 
 ### Chat-Weighted Highlight Picking
@@ -449,7 +485,9 @@ Example:
   "subtitle_preset": "legendary",
   "motion": true,
   "llm_enable": true,
-  "llm_provider": "heuristic",
+  "llm_provider": "huggingface",
+  "llm_model": "moonshotai/Kimi-K2-Instruct-0905",
+  "llm_api_key_env": "HF_TOKEN",
   "export_bundle": true
 }
 ```
@@ -464,6 +502,65 @@ Example:
 `POST /run` queues a job using the same JSON shape as `--config`.
 
 If the environment variable named by `--api-key-env` is set, requests must include `x-api-key`.
+
+Auth and security controls for API mode:
+
+- `--api-key-env <ENV_VAR>`
+- `--api-token-sha256-env <ENV_VAR>`
+- `--api-clients-json-env <ENV_VAR>`
+- `--api-max-body-bytes <N>`
+- `--api-rate-limit-per-minute <N>`
+- `--api-max-queued-jobs <N>`
+- `--api-allow-url-input`
+- `--security-audit-log <PATH>`
+
+`Authorization: Bearer <token>` is also accepted as an alternative to `x-api-key`.
+
+Input isolation controls:
+
+- `--max-input-bytes <N>`
+- `--allowed-input-exts <comma,list>`
+- `--secure-temp-cleanup <true|false>`
+
+## Security
+
+Current built-in protections:
+
+- loopback-only API bind enforcement
+- optional `x-api-key` auth
+- optional SHA-256 token verification via `--api-token-sha256-env`
+- optional scoped client tokens via `--api-clients-json-env`
+- request size and header-count limits
+- in-memory rate limiting
+- queue limits and API job constraints
+- security audit logging
+- local input file validation with extension and size policy
+
+Security details and deployment guidance are documented in [SECURITY.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/SECURITY.md).
+
+Security implementation stages are documented in [docs/SECURITY_ROADMAP.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/SECURITY_ROADMAP.md).
+
+Production scaffolding files:
+
+- [.env.example](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.env.example)
+- [deploy/docker-compose.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/deploy/docker-compose.yml)
+- [deploy/nginx.conf](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/deploy/nginx.conf)
+- [deploy/README.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/deploy/README.md)
+
+Security and governance docs:
+
+- [docs/SECRETS.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/SECRETS.md)
+- [PRIVACY.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/PRIVACY.md)
+- [DATA_RETENTION.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/DATA_RETENTION.md)
+- [docs/VULNERABILITY_DISCLOSURE.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/VULNERABILITY_DISCLOSURE.md)
+- [docs/DEPLOYMENT_HARDENING_CHECKLIST.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/DEPLOYMENT_HARDENING_CHECKLIST.md)
+- [docs/RELEASE_GATE.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/RELEASE_GATE.md)
+
+Supply-chain and release workflows:
+
+- [.github/workflows/ci.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/ci.yml)
+- [.github/workflows/security-audit.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/security-audit.yml)
+- [.github/workflows/release-gate.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/release-gate.yml)
 
 ## Proof Layer
 

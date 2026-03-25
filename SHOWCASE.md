@@ -22,7 +22,8 @@ This writes a compact evidence package to `output/showcase-smoke/`.
 Full local run:
 
 ```powershell
-cargo run -- --input ".\gang.mp4" --num-clips 5 --min-duration 10 --captions --subtitle-preset legendary --subtitle-animation emphasis --crop --crop-mode face --llm-enable --llm-provider heuristic --export-bundle --proof-report
+$env:HF_TOKEN="..."
+cargo run -- --input ".\gang.mp4" --num-clips 5 --min-duration 10 --captions --subtitle-preset legendary --subtitle-animation emphasis --crop --crop-mode face --llm-enable --llm-provider huggingface --llm-model "moonshotai/Kimi-K2-Instruct-0905" --llm-api-key-env HF_TOKEN --export-bundle --proof-report
 ```
 
 Example reproducible config run:
@@ -30,6 +31,8 @@ Example reproducible config run:
 ```powershell
 cargo run -- --config ".\showcase-config.json"
 ```
+
+`showcase-config.json` and `showcase-smoke.json` now prefer Hugging Face for demo metadata and reranking when `HF_TOKEN` is set. If the token is missing or the provider fails, the pipeline falls back to the local heuristic path.
 
 ## What Evaluators Should Look For
 

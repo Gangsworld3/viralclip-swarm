@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+  viralclip-swarm:
+    image: viralclip-swarm:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      VIRALCLIP_API_TOKEN_SHA256: ${VIRALCLIP_API_TOKEN_SHA256:-}
+      VIRALCLIP_API_KEY: ${VIRALCLIP_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    command:
+      - ./target/release/viralclip-swarm
+      - --api
+      - --api-bind
+      - 127.0.0.1:8787
+      - --api-max-body-bytes
+      - "1048576"
+      - --api-rate-limit-per-minute
+      - "60"
+    volumes:
+      - ../output:/app/output
+    restart: unless-stopped
+    network_mode: service:proxy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      - viralclip-swarm
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
