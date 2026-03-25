@@ -1,0 +1,35 @@
+{
+  "summary": {
+    "run_timestamp": "2026-03-25T10:30:52.448279800+00:00",
+    "run_timestamp_human": "25 Mar 2026, 10:30",
+    "total_clips": 1,
+    "successful_clips": 1,
+    "failed_clips": 0,
+    "total_duration_ms": 6182
+  },
+  "clips": [
+    {
+      "clip_id": 1,
+      "start_sec": 2.0,
+      "duration": 8.0,
+      "energy_score": 1.0,
+      "laughter_score": 0.49278605,
+      "motion_score": 0.0,
+      "chat_score": 0.0,
+      "transcript_score": 1.0,
+      "hook_score": 1.0,
+      "transcript_density": 2.1676302,
+      "readability_score": 0.8923694,
+      "total_score": 3.4988728,
+      "extract_ms": 72,
+      "subtitles_ms": 6078,
+      "crop_ms": 0,
+      "total_ms": 6182,
+      "success": true,
+      "duplicate_of": null,
+      "error": "",
+      "timestamp": "2026-03-25T10:31:11.595554900+00:00",
+      "timestamp_human": "25 Mar 2026, 10:31"
+    }
+  ]
+}

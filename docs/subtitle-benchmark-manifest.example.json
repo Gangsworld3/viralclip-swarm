@@ -1,0 +1,17 @@
+[
+  {
+    "id": "podcast_clean",
+    "input": "input/podcast_clean.mp4",
+    "note": "Clean speech baseline"
+  },
+  {
+    "id": "street_noisy",
+    "input": "input/street_noisy.mp4",
+    "note": "Noisy outdoor audio"
+  },
+  {
+    "id": "music_overlay",
+    "input": "input/music_overlay.mp4",
+    "note": "Voice plus background music"
+  }
+]

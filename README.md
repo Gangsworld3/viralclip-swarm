@@ -35,6 +35,12 @@ For a larger local demo on the bundled source video, use:
 cargo run -- --config ".\showcase-config.json"
 ```
 
+Or run the full automation package:
+
+```powershell
+.\scripts\run-full-showcase.ps1
+```
+
 ## Demo Package
 
 Tracked demo assets live in [demo/README.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/demo/README.md).
@@ -263,7 +269,7 @@ Transcription options:
 Burn-in options:
 
 - `--subtitles-mode <auto|ass|subtitles>`
-- `--subtitle-preset <classic|legendary>`
+- `--subtitle-preset <classic|legendary|creator_pro|creator_neon|creator_minimal|creator_bold>`
 - `--subtitle-font <FONT>`
 - `--subtitle-size <PX>`
 - `--subtitle-color <ASS_HEX>`
@@ -277,7 +283,13 @@ Burn-in options:
 - `--subtitle-alignment <N>`
 - `--subtitle-margin-v <PX>`
 - `--subtitle-style-map <JSON_PATH>`
-- `--subtitle-animation <none|karaoke|emphasis|impact|pulse>`
+- `--subtitle-animation <none|karaoke|emphasis|impact|pulse|creator_pro>`
+- `--subtitle-emoji-layer <true|false>`
+- `--subtitle-beat-sync <true|false>`
+- `--subtitle-scene-fx <true|false>`
+- `--subtitle-emoji-layer <true|false>`
+- `--subtitle-beat-sync <true|false>`
+- `--subtitle-scene-fx <true|false>`
 
 When subtitle animation is enabled, the pipeline uses the ASS rendering path automatically so word-level emphasis can be burned into the clip.
 
@@ -513,6 +525,8 @@ Auth and security controls for API mode:
 - `--api-max-queued-jobs <N>`
 - `--api-allow-url-input`
 - `--security-audit-log <PATH>`
+- `--api-quota-store <PATH>`
+- `--api-client-daily-quota-runs <N>`
 
 `Authorization: Bearer <token>` is also accepted as an alternative to `x-api-key`.
 
@@ -561,6 +575,17 @@ Supply-chain and release workflows:
 - [.github/workflows/ci.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/ci.yml)
 - [.github/workflows/security-audit.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/security-audit.yml)
 - [.github/workflows/release-gate.yml](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/.github/workflows/release-gate.yml)
+
+## Automation Scripts
+
+- Full showcase runner: [scripts/run-full-showcase.ps1](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/scripts/run-full-showcase.ps1)
+- Preset demo generator: [scripts/generate-preset-demos.ps1](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/scripts/generate-preset-demos.ps1)
+- Subtitle benchmark harness: [scripts/subtitle-benchmark.ps1](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/scripts/subtitle-benchmark.ps1)
+- API token rotation helper: [scripts/rotate-api-token.ps1](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/scripts/rotate-api-token.ps1)
+
+Subtitle benchmark docs: [docs/SUBTITLE_BENCHMARK.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/docs/SUBTITLE_BENCHMARK.md)
+
+Outreach templates: [outreach/README.md](/C:/Users/hp/Documents/New%20folder/viralclip-swarm/outreach/README.md)
 
 ## Proof Layer
 

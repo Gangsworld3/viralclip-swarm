@@ -32,6 +32,12 @@ Example reproducible config run:
 cargo run -- --config ".\showcase-config.json"
 ```
 
+One-command showcase (full package + preset demos + subtitle benchmark):
+
+```powershell
+.\scripts\run-full-showcase.ps1
+```
+
 `showcase-config.json` and `showcase-smoke.json` now prefer Hugging Face for demo metadata and reranking when `HF_TOKEN` is set. If the token is missing or the provider fails, the pipeline falls back to the local heuristic path.
 
 ## What Evaluators Should Look For

@@ -25,7 +25,7 @@ use which::which;
 
 use viralclip_swarm::ai::{build_storyboard, rerank_candidates, write_storyboard, AiClipContext, AiOptions};
 use viralclip_swarm::subtitles::{
-    burn_subtitles, burn_subtitles_via_ass, SubtitleAnimationPreset, SubtitleStyle,
+    burn_subtitles, burn_subtitles_via_ass, SubtitleAnimationPreset, SubtitleRenderOptions, SubtitleStyle,
 };
 
 #[derive(Parser, Debug)]
@@ -113,10 +113,20 @@ struct Cli {
     subtitle_alignment: u32,
     #[arg(long, default_value_t = 28)]
     subtitle_margin_v: u32,
-    #[arg(long, default_value = "classic", value_parser = ["classic", "legendary"])]
+    #[arg(
+        long,
+        default_value = "classic",
+        value_parser = ["classic", "legendary", "creator_pro", "creator_neon", "creator_minimal", "creator_bold"]
+    )]
     subtitle_preset: String,
-    #[arg(long, default_value = "none", value_parser = ["none", "karaoke", "emphasis", "impact", "pulse"])]
+    #[arg(long, default_value = "none", value_parser = ["none", "karaoke", "emphasis", "impact", "pulse", "creator_pro"])]
     subtitle_animation: String,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    subtitle_emoji_layer: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    subtitle_beat_sync: bool,
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    subtitle_scene_fx: bool,
     #[arg(long, default_value_t = false)]
     motion: bool,
     #[arg(long, default_value_t = 0.4)]
@@ -175,6 +185,10 @@ struct Cli {
     api_max_queued_jobs: u32,
     #[arg(long, default_value = "./output/security_audit.log")]
     security_audit_log: String,
+    #[arg(long, default_value = "./output/api_quota_state.json")]
+    api_quota_store: String,
+    #[arg(long, default_value_t = 200)]
+    api_client_daily_quota_runs: u32,
     #[arg(long, default_value_t = 15)]
     api_read_timeout_secs: u64,
     #[arg(long, default_value_t = 15)]
@@ -235,7 +249,11 @@ struct ProcessingOptions {
     crop: bool,
     crop_mode: String,
     subtitles_mode: String,
+    subtitle_preset: String,
     subtitle_animation: String,
+    subtitle_emoji_layer: bool,
+    subtitle_beat_sync: bool,
+    subtitle_scene_fx: bool,
     output_dir: String,
     timestamp_mode: String,
 }
@@ -347,6 +365,9 @@ struct ConfigFile {
     subtitle_margin_v: Option<u32>,
     subtitle_preset: Option<String>,
     subtitle_animation: Option<String>,
+    subtitle_emoji_layer: Option<bool>,
+    subtitle_beat_sync: Option<bool>,
+    subtitle_scene_fx: Option<bool>,
     motion: Option<bool>,
     scene_threshold: Option<f64>,
     subtitles_mode: Option<String>,
@@ -376,6 +397,8 @@ struct ConfigFile {
     api_allow_url_input: Option<bool>,
     api_max_queued_jobs: Option<u32>,
     security_audit_log: Option<String>,
+    api_quota_store: Option<String>,
+    api_client_daily_quota_runs: Option<u32>,
     api_read_timeout_secs: Option<u64>,
     api_write_timeout_secs: Option<u64>,
     api_max_header_line_bytes: Option<usize>,
@@ -447,6 +470,7 @@ struct ApiJobStatus {
 
 type JobMap = Arc<Mutex<HashMap<usize, ApiJobStatus>>>;
 type RateLimitMap = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
+type QuotaLock = Arc<Mutex<()>>;
 
 #[derive(Clone, Debug)]
 struct ApiSecurityConfig {
@@ -464,6 +488,8 @@ struct ApiSecurityConfig {
     url_allowlist: Vec<String>,
     url_dns_guard: bool,
     malware_scan_cmd: Option<String>,
+    quota_store_path: PathBuf,
+    client_daily_quota_runs: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -477,6 +503,12 @@ struct ApiClientRecord {
 struct ApiPrincipal {
     client_id: String,
     scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApiQuotaState {
+    day_utc: String,
+    clients: HashMap<String, u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -863,6 +895,57 @@ fn load_api_clients_from_env(env_name: &str) -> Result<Vec<ApiClientRecord>> {
     let clients: Vec<ApiClientRecord> =
         serde_json::from_str(&raw).with_context(|| format!("parse API clients JSON from {}", env_name))?;
     Ok(clients)
+}
+
+fn current_utc_day() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
+}
+
+fn load_quota_state(path: &Path, day_utc: &str) -> Result<ApiQuotaState> {
+    if !path.exists() {
+        return Ok(ApiQuotaState {
+            day_utc: day_utc.to_string(),
+            clients: HashMap::new(),
+        });
+    }
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read quota state {}", path.display()))?;
+    let mut state: ApiQuotaState =
+        serde_json::from_str(&raw).with_context(|| format!("parse quota state {}", path.display()))?;
+    if state.day_utc != day_utc {
+        state.day_utc = day_utc.to_string();
+        state.clients.clear();
+    }
+    Ok(state)
+}
+
+fn save_quota_state(path: &Path, state: &ApiQuotaState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create quota state dir {}", parent.display()))?;
+        }
+    }
+    let payload = serde_json::to_string_pretty(state).context("serialize quota state")?;
+    std::fs::write(path, payload).with_context(|| format!("write quota state {}", path.display()))?;
+    Ok(())
+}
+
+fn check_and_increment_client_quota(
+    lock: &QuotaLock,
+    path: &Path,
+    client_id: &str,
+    limit: u32,
+) -> Result<bool> {
+    let _guard = lock.lock().map_err(|_| anyhow::anyhow!("quota lock poisoned"))?;
+    let day = current_utc_day();
+    let mut state = load_quota_state(path, &day)?;
+    let entry = state.clients.entry(client_id.to_string()).or_insert(0);
+    if *entry >= limit {
+        return Ok(false);
+    }
+    *entry += 1;
+    save_quota_state(path, &state)?;
+    Ok(true)
 }
 
 fn maybe_run_malware_scan(scan_cmd: Option<&str>, target: &Path) -> Result<()> {
@@ -2295,6 +2378,62 @@ fn subtitle_style_from_cli(cli: &Cli) -> SubtitleStyle {
             alignment: 2,
             margin_v: 42,
         },
+        "creator_pro" => SubtitleStyle {
+            font: "Arial Black".to_string(),
+            size: 40,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000F6FF".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&H96000000".to_string(),
+            outline: 6,
+            shadow: 0,
+            border_style: 3,
+            bold: true,
+            alignment: 2,
+            margin_v: 52,
+        },
+        "creator_neon" => SubtitleStyle {
+            font: "Arial Black".to_string(),
+            size: 40,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000FF66".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&HA0000000".to_string(),
+            outline: 7,
+            shadow: 0,
+            border_style: 3,
+            bold: true,
+            alignment: 2,
+            margin_v: 52,
+        },
+        "creator_minimal" => SubtitleStyle {
+            font: "Arial".to_string(),
+            size: 34,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000F6FF".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&H5A000000".to_string(),
+            outline: 3,
+            shadow: 0,
+            border_style: 1,
+            bold: true,
+            alignment: 2,
+            margin_v: 44,
+        },
+        "creator_bold" => SubtitleStyle {
+            font: "Impact".to_string(),
+            size: 42,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000F6FF".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&HB0000000".to_string(),
+            outline: 8,
+            shadow: 0,
+            border_style: 3,
+            bold: true,
+            alignment: 2,
+            margin_v: 56,
+        },
         _ => classic_defaults.clone(),
     };
 
@@ -2364,6 +2503,7 @@ fn subtitle_animation_preset(value: &str) -> SubtitleAnimationPreset {
         "emphasis" => SubtitleAnimationPreset::Emphasis,
         "impact" => SubtitleAnimationPreset::Impact,
         "pulse" => SubtitleAnimationPreset::Pulse,
+        "creator_pro" => SubtitleAnimationPreset::CreatorPro,
         _ => SubtitleAnimationPreset::None,
     }
 }
@@ -2973,6 +3113,9 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_arg(&mut args, "--subtitle-margin-v", config.subtitle_margin_v);
     push_config_arg(&mut args, "--subtitle-preset", config.subtitle_preset);
     push_config_arg(&mut args, "--subtitle-animation", config.subtitle_animation);
+    push_config_arg(&mut args, "--subtitle-emoji-layer", config.subtitle_emoji_layer);
+    push_config_arg(&mut args, "--subtitle-beat-sync", config.subtitle_beat_sync);
+    push_config_arg(&mut args, "--subtitle-scene-fx", config.subtitle_scene_fx);
     push_config_flag(&mut args, "--motion", config.motion);
     push_config_arg(&mut args, "--scene-threshold", config.scene_threshold);
     push_config_arg(&mut args, "--subtitles-mode", config.subtitles_mode);
@@ -3006,6 +3149,12 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_flag(&mut args, "--api-allow-url-input", config.api_allow_url_input);
     push_config_arg(&mut args, "--api-max-queued-jobs", config.api_max_queued_jobs);
     push_config_arg(&mut args, "--security-audit-log", config.security_audit_log);
+    push_config_arg(&mut args, "--api-quota-store", config.api_quota_store);
+    push_config_arg(
+        &mut args,
+        "--api-client-daily-quota-runs",
+        config.api_client_daily_quota_runs,
+    );
     push_config_arg(&mut args, "--api-read-timeout-secs", config.api_read_timeout_secs);
     push_config_arg(&mut args, "--api-write-timeout-secs", config.api_write_timeout_secs);
     push_config_arg(
@@ -3209,18 +3358,50 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
             let subtitle_started = Instant::now();
             let style = subtitle_style_for_clip(&context.subtitle_styles, task.clip_id);
             let animation = subtitle_animation_preset(&context.processing.subtitle_animation);
+            let scene_score = if context.processing.subtitle_scene_fx {
+                ((task.metrics.motion * 0.65) + (task.metrics.energy * 0.35)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let render_options = SubtitleRenderOptions {
+                template: context.processing.subtitle_preset.clone(),
+                emoji_layer: context.processing.subtitle_emoji_layer,
+                beat_sync: context.processing.subtitle_beat_sync,
+                scene_score,
+            };
             let burn_result = match context.processing.subtitles_mode.as_str() {
-                "ass" => burn_subtitles_via_ass(&current, &clip_srt, &captioned, style, animation),
+                "ass" => burn_subtitles_via_ass(
+                    &current,
+                    &clip_srt,
+                    &captioned,
+                    style,
+                    animation,
+                    Some(&render_options),
+                ),
                 "subtitles" => match style {
                     Some(style) if animation == SubtitleAnimationPreset::None => {
                         burn_subtitles(&current, &clip_srt, &captioned, style)
                     }
-                    Some(_) => burn_subtitles_via_ass(&current, &clip_srt, &captioned, style, animation),
+                    Some(_) => burn_subtitles_via_ass(
+                        &current,
+                        &clip_srt,
+                        &captioned,
+                        style,
+                        animation,
+                        Some(&render_options),
+                    ),
                     None => Err(anyhow::anyhow!("missing subtitle style for subtitles mode")),
                 },
                 "auto" => {
                     if animation != SubtitleAnimationPreset::None {
-                        burn_subtitles_via_ass(&current, &clip_srt, &captioned, style, animation)
+                        burn_subtitles_via_ass(
+                            &current,
+                            &clip_srt,
+                            &captioned,
+                            style,
+                            animation,
+                            Some(&render_options),
+                        )
                     } else if let Some(style) = style {
                         burn_subtitles(&current, &clip_srt, &captioned, style)
                             .or_else(|_| {
@@ -3230,6 +3411,7 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
                                     &captioned,
                                     Some(style),
                                     SubtitleAnimationPreset::None,
+                                    Some(&render_options),
                                 )
                             })
                     } else {
@@ -3239,10 +3421,18 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
                             &captioned,
                             None,
                             SubtitleAnimationPreset::None,
+                            Some(&render_options),
                         )
                     }
                 }
-                _ => burn_subtitles_via_ass(&current, &clip_srt, &captioned, style, animation),
+                _ => burn_subtitles_via_ass(
+                    &current,
+                    &clip_srt,
+                    &captioned,
+                    style,
+                    animation,
+                    Some(&render_options),
+                ),
             };
 
             if let Err(error) = burn_result {
@@ -3577,11 +3767,35 @@ fn prompt_for_cli() -> Result<Cli> {
             args.push("--transcription-api-key-env".to_string());
             args.push(api_key_env);
         }
-        let subtitle_preset = prompt_with_default("Subtitle preset (classic/legendary)", "legendary")?;
+        let subtitle_preset = prompt_with_default(
+            "Subtitle preset (classic/legendary/creator_pro/creator_neon/creator_minimal/creator_bold)",
+            "legendary",
+        )?;
         let subtitle_animation = prompt_with_default(
-            "Subtitle animation (none/karaoke/emphasis/impact/pulse)",
+            "Subtitle animation (none/karaoke/emphasis/impact/pulse/creator_pro)",
             "none",
         )?;
+        if prompt_bool("Enable emoji/sticker subtitle layer", true)? {
+            args.push("--subtitle-emoji-layer".to_string());
+            args.push("true".to_string());
+        } else {
+            args.push("--subtitle-emoji-layer".to_string());
+            args.push("false".to_string());
+        }
+        if prompt_bool("Enable beat-sync subtitle timing", true)? {
+            args.push("--subtitle-beat-sync".to_string());
+            args.push("true".to_string());
+        } else {
+            args.push("--subtitle-beat-sync".to_string());
+            args.push("false".to_string());
+        }
+        if prompt_bool("Enable scene-aware subtitle FX", true)? {
+            args.push("--subtitle-scene-fx".to_string());
+            args.push("true".to_string());
+        } else {
+            args.push("--subtitle-scene-fx".to_string());
+            args.push("false".to_string());
+        }
         let subtitles_mode = prompt_with_default("Subtitles mode (auto/ass/subtitles)", "auto")?;
         args.push("--subtitle-preset".to_string());
         args.push(subtitle_preset);
@@ -3737,12 +3951,15 @@ fn print_run_banner(cli: &Cli) {
         println!(
             "{}",
             format!(
-                "Subtitle preset: {} | style: font={} size={} mode={} animation={}",
+                "Subtitle preset: {} | style: font={} size={} mode={} animation={} emoji_layer={} beat_sync={} scene_fx={}",
                 cli.subtitle_preset,
                 cli.subtitle_font,
                 cli.subtitle_size,
                 cli.subtitles_mode,
-                cli.subtitle_animation
+                cli.subtitle_animation,
+                cli.subtitle_emoji_layer,
+                cli.subtitle_beat_sync,
+                cli.subtitle_scene_fx
             )
             .green()
         );
@@ -3941,7 +4158,11 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
             crop: cli.crop,
             crop_mode: cli.crop_mode.clone(),
             subtitles_mode: cli.subtitles_mode.clone(),
+            subtitle_preset: cli.subtitle_preset.clone(),
             subtitle_animation: cli.subtitle_animation.clone(),
+            subtitle_emoji_layer: cli.subtitle_emoji_layer,
+            subtitle_beat_sync: cli.subtitle_beat_sync,
+            subtitle_scene_fx: cli.subtitle_scene_fx,
             output_dir: cli.output_dir.clone(),
             timestamp_mode: cli.timestamp_mode.clone(),
         },
@@ -4042,6 +4263,7 @@ fn handle_api_connection(
     job_tx: &mpsc::Sender<(usize, Cli)>,
     next_job_id: &Arc<Mutex<usize>>,
     rate_limits: &RateLimitMap,
+    quota_lock: &QuotaLock,
     security: &ApiSecurityConfig,
 ) -> Result<()> {
     stream
@@ -4227,6 +4449,22 @@ fn handle_api_connection(
                 write_json_error(&mut stream, "503 Service Unavailable", "job queue is full")?;
                 return Ok(());
             }
+            if !check_and_increment_client_quota(
+                quota_lock,
+                &security.quota_store_path,
+                &principal.client_id,
+                security.client_daily_quota_runs.max(1),
+            )? {
+                let _ = append_security_audit_log(
+                    &security.audit_log_path,
+                    "quota_limit",
+                    &principal.client_id,
+                    "rejected",
+                    "daily run quota exceeded",
+                );
+                write_json_error(&mut stream, "429 Too Many Requests", "daily run quota exceeded")?;
+                return Ok(());
+            }
             let job_id = {
                 let mut guard = next_job_id.lock().map_err(|_| anyhow::anyhow!("job counter poisoned"))?;
                 let id = *guard;
@@ -4337,6 +4575,7 @@ fn run_api_server_with_auth(bind_addr: &str, security: ApiSecurityConfig) -> Res
         .with_context(|| format!("bind API server to {}", bind_addr))?;
     let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
     let rate_limits: RateLimitMap = Arc::new(Mutex::new(HashMap::new()));
+    let quota_lock: QuotaLock = Arc::new(Mutex::new(()));
     let next_job_id = Arc::new(Mutex::new(1usize));
     let (job_tx, job_rx) = mpsc::channel::<(usize, Cli)>();
     let jobs_for_worker = Arc::clone(&jobs);
@@ -4402,8 +4641,8 @@ fn run_api_server_with_auth(bind_addr: &str, security: ApiSecurityConfig) -> Res
     println!(
         "{}",
         format!(
-            "API hardening enabled: max_body={} bytes, rate_limit={}/min, loopback-only bind enforced",
-            security.max_body_bytes, security.rate_limit_per_minute
+            "API hardening enabled: max_body={} bytes, rate_limit={}/min, daily_quota={} runs/client",
+            security.max_body_bytes, security.rate_limit_per_minute, security.client_daily_quota_runs
         )
         .cyan()
     );
@@ -4417,6 +4656,7 @@ fn run_api_server_with_auth(bind_addr: &str, security: ApiSecurityConfig) -> Res
                     &job_tx,
                     &next_job_id,
                     &rate_limits,
+                    &quota_lock,
                     &security,
                 ) {
                     eprintln!("API request failed: {error}");
@@ -4453,6 +4693,8 @@ fn main() -> Result<()> {
             url_allowlist: parse_host_allowlist(&cli.api_url_allowlist),
             url_dns_guard: cli.api_url_dns_guard,
             malware_scan_cmd: cli.malware_scan_cmd.clone(),
+            quota_store_path: PathBuf::from(&cli.api_quota_store),
+            client_daily_quota_runs: cli.api_client_daily_quota_runs.max(1),
         };
         run_api_server_with_auth(&cli.api_bind, security)
     } else {
@@ -4464,12 +4706,13 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         api_request_authorized, build_proof_report, check_rate_limit, clean_transcript_text,
+        check_and_increment_client_quota,
         cli_from_args_with_config, cli_from_config, estimate_music_noise_penalty,
         estimate_speech_confidence, format_srt_timestamp, sha256_hex, parse_clock_timestamp,
         parse_face_centers, parse_srt_entries, parse_srt_timestamp, readability_from_density,
         readability_from_density_and_confidence, validate_api_bind_address, validate_api_job_request,
         BenchmarkLog, Cli, ClipTiming, ConfigFile, RunSummary, ApiClientRecord, ApiSecurityConfig,
-        transcript_similarity, RateLimitMap,
+        transcript_similarity, QuotaLock, RateLimitMap,
     };
     use clap::Parser;
     use std::collections::HashMap;
@@ -4541,6 +4784,8 @@ mod tests {
             url_allowlist: Vec::new(),
             url_dns_guard: true,
             malware_scan_cmd: None,
+            quota_store_path: std::path::PathBuf::from("./output/test_quota.json"),
+            client_daily_quota_runs: 10,
         };
         assert!(api_request_authorized(&headers, &security).is_some());
     }
@@ -4569,6 +4814,8 @@ mod tests {
             url_allowlist: Vec::new(),
             url_dns_guard: true,
             malware_scan_cmd: None,
+            quota_store_path: std::path::PathBuf::from("./output/test_quota.json"),
+            client_daily_quota_runs: 10,
         };
         let principal = api_request_authorized(&headers, &security).unwrap();
         assert_eq!(principal.client_id, "demo-client");
@@ -4581,6 +4828,16 @@ mod tests {
         assert!(check_rate_limit(&rate_limits, "127.0.0.1", 2).unwrap());
         assert!(check_rate_limit(&rate_limits, "127.0.0.1", 2).unwrap());
         assert!(!check_rate_limit(&rate_limits, "127.0.0.1", 2).unwrap());
+    }
+
+    #[test]
+    fn quota_blocks_after_daily_limit() {
+        let temp = TempDir::new().unwrap();
+        let quota_file = temp.path().join("quota.json");
+        let lock: QuotaLock = Arc::new(Mutex::new(()));
+        assert!(check_and_increment_client_quota(&lock, &quota_file, "client-a", 2).unwrap());
+        assert!(check_and_increment_client_quota(&lock, &quota_file, "client-a", 2).unwrap());
+        assert!(!check_and_increment_client_quota(&lock, &quota_file, "client-a", 2).unwrap());
     }
 
     #[test]
@@ -4612,6 +4869,8 @@ mod tests {
             url_allowlist: Vec::new(),
             url_dns_guard: true,
             malware_scan_cmd: None,
+            quota_store_path: std::path::PathBuf::from("./output/test_quota.json"),
+            client_daily_quota_runs: 10,
         };
         assert!(validate_api_job_request(&cli, &security).is_err());
     }
@@ -4641,6 +4900,8 @@ mod tests {
             url_allowlist: Vec::new(),
             url_dns_guard: false,
             malware_scan_cmd: None,
+            quota_store_path: std::path::PathBuf::from("./output/test_quota.json"),
+            client_daily_quota_runs: 10,
         };
         assert!(validate_api_job_request(&cli, &security).is_err());
     }

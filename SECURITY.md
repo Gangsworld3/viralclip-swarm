@@ -10,6 +10,7 @@ Current protections:
 - request body size limit
 - request header count limit
 - in-memory rate limiting
+- persistent per-client daily API run quotas
 - optional `x-api-key` authentication
 - optional SHA-256 token verification through environment variables
 - optional multi-client token registry with scopes
@@ -25,6 +26,12 @@ Preferred option:
 2. Compute its SHA-256 hex digest.
 3. Store the digest in `VIRALCLIP_API_TOKEN_SHA256`.
 4. Send the raw token as the `x-api-key` header.
+
+Helper script:
+
+```powershell
+.\scripts\rotate-api-token.ps1
+```
 
 The server will hash the provided token and compare it to the stored digest.
 
@@ -79,6 +86,7 @@ Examples:
 - authorization failures
 - rate-limit rejections
 - queue-limit rejections
+- daily-quota rejections
 - accepted jobs
 - completed or failed jobs
 
