@@ -1,0 +1,7 @@
+segment,priority,company_or_creator,contact_name,role_or_channel,platform,profile_url,email_or_dm,region,last_relevant_post_date,message_template,personalization_hook,status,first_sent_date,followup_1_date,followup_2_date,last_touch_date,response_stage,next_action,next_action_date,outcome,notes
+ai_company,high,,,,LinkedIn,,,,ai_companies_pitch,,"not_started",,,,,no_response,,,,
+ai_company,high,,,,Email,,,,ai_companies_pitch,,"not_started",,,,,no_response,,,,
+ai_company,medium,,,,X,,,,ai_companies_pitch,,"not_started",,,,,no_response,,,,
+influencer,high,,,,Instagram,,,,influencers_pitch,,"not_started",,,,,no_response,,,,
+influencer,high,,,,YouTube,,,,influencers_pitch,,"not_started",,,,,no_response,,,,
+influencer,medium,,,,X,,,,influencers_pitch,,"not_started",,,,,no_response,,,,
