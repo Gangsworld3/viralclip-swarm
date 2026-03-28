@@ -6,8 +6,8 @@ The repository should be easy to evaluate in under five minutes.
 
 Required pieces:
 
-- a clear README with proof links
-- tracked demo assets in `demo/`
+- a clear README
+- reproducible demo configs in the repo
 - reproducible configs in the repo root
 - contribution guidance
 - release notes or tag history
@@ -15,7 +15,7 @@ Required pieces:
 ## Recommended Release Layout
 
 - `README.md`: product overview and quick start
-- `demo/`: curated preview media
+- `demo/`: lightweight demo metadata or small proof artifacts
 - `docs/GITHUB_ABOUT.md`: GitHub about metadata
 - `SHOWCASE.md`: how to reproduce demo runs
 - `RELEASE_SUMMARY.md`: concise release narrative

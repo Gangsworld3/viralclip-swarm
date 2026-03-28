@@ -1062,7 +1062,61 @@ fn download_video(url: &str, output_dir: &Path) -> Result<PathBuf> {
         .context("No mp4 file found after download")
 }
 
+fn has_audio_stream(video_path: &Path) -> Result<bool> {
+    let ffprobe = which("ffprobe").context("ffprobe not found in PATH")?;
+    let mut cmd = Command::new(&ffprobe);
+    cmd.arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("a:0")
+        .arg("-show_entries")
+        .arg("stream=codec_type")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(video_path);
+
+    match command_output_checked(&mut cmd, "probing audio stream") {
+        Ok(output) => Ok(String::from_utf8_lossy(&output.stdout).contains("audio")),
+        Err(_) => Ok(false),
+    }
+}
+
+fn generate_silent_audio(video_path: &Path, output_wav: &Path) -> Result<()> {
+    let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
+    let duration =
+        probe_video_duration(video_path).context("probe duration for silent audio fallback")?;
+    warn!(
+        "Input {} has no usable audio stream; generating {:.2}s of silent fallback audio",
+        video_path.display(),
+        duration
+    );
+    let status = Command::new(&ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("anullsrc=r=16000:cl=mono")
+        .arg("-t")
+        .arg(format!("{duration:.3}"))
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg(output_wav)
+        .status()
+        .context("failed to run ffmpeg for silent audio fallback")?;
+    if !status.success() {
+        anyhow::bail!("ffmpeg silent audio fallback failed");
+    }
+    Ok(())
+}
+
 fn extract_audio(video_path: &Path, output_wav: &Path) -> Result<()> {
+    if !has_audio_stream(video_path)? {
+        return generate_silent_audio(video_path, output_wav);
+    }
+
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
     let status = Command::new(&ffmpeg)
         .arg("-hide_banner")
@@ -1071,6 +1125,8 @@ fn extract_audio(video_path: &Path, output_wav: &Path) -> Result<()> {
         .arg("-y")
         .arg("-i")
         .arg(video_path)
+        .arg("-map")
+        .arg("0:a:0")
         .arg("-vn")
         .arg("-acodec")
         .arg("pcm_s16le")
@@ -1081,10 +1137,15 @@ fn extract_audio(video_path: &Path, output_wav: &Path) -> Result<()> {
         .arg(output_wav)
         .status()
         .context("failed to run ffmpeg for audio extraction")?;
-    if !status.success() {
-        anyhow::bail!("ffmpeg audio extraction failed");
+    if status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    warn!(
+        "Audio extraction failed for {}; falling back to silent audio",
+        video_path.display()
+    );
+    generate_silent_audio(video_path, output_wav)
 }
 
 fn normalize_scores(values: &[f32]) -> Vec<f32> {
@@ -3646,6 +3707,93 @@ fn finalize_output(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn synthesize_video_audio_track(input_path: &Path, output_path: &Path) -> Result<()> {
+    let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
+    let copy_status = Command::new(&ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("anullsrc=r=48000:cl=stereo")
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c:v")
+        .arg("copy")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-shortest")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output_path)
+        .status()
+        .context("failed to run ffmpeg for silent video audio mux")?;
+    if copy_status.success() {
+        return Ok(());
+    }
+
+    warn!(
+        "Stream-copy audio mux failed for {}; retrying with video re-encode",
+        input_path.display()
+    );
+    let reencode_status = Command::new(&ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("anullsrc=r=48000:cl=stereo")
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("fast")
+        .arg("-crf")
+        .arg("23")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-shortest")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output_path)
+        .status()
+        .context("failed to run ffmpeg for silent video audio re-encode")?;
+    if !reencode_status.success() {
+        anyhow::bail!("ffmpeg failed to add fallback audio track");
+    }
+    Ok(())
+}
+
+fn ensure_video_has_audio(input_path: &Path, output_path: &Path) -> Result<()> {
+    if has_audio_stream(input_path)? {
+        finalize_output(input_path, output_path)?;
+        return Ok(());
+    }
+
+    warn!(
+        "Output clip {} has no audio stream; muxing silent fallback track",
+        input_path.display()
+    );
+    synthesize_video_audio_track(input_path, output_path)
+}
+
 fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
     let started_at = Instant::now();
     let mut extract_ms = 0u128;
@@ -3847,7 +3995,12 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
         );
     }
 
-    if let Err(error) = finalize_output(&current, &final_output) {
+    let final_source = if current == final_output {
+        current.clone()
+    } else {
+        current
+    };
+    if let Err(error) = ensure_video_has_audio(&final_source, &final_output) {
         return record_failure(
             task,
             &context.processing,
@@ -5331,6 +5484,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use tempfile::{NamedTempFile, TempDir};
+    use which::which;
 
     #[test]
     fn parses_clock_timestamps() {
@@ -5632,6 +5786,37 @@ mod tests {
             density > 2.4 && density < 2.6,
             "unexpected density: {density}"
         );
+    }
+
+    #[test]
+    fn extract_audio_falls_back_to_silence_for_video_only_input() {
+        if which("ffmpeg").is_err() || which("ffprobe").is_err() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let wav_path = dir.path().join("audio.wav");
+        super::extract_audio(std::path::Path::new("tests/output/filter.mp4"), &wav_path).unwrap();
+        assert!(wav_path.is_file(), "expected fallback wav to be created");
+        assert!(std::fs::metadata(&wav_path).unwrap().len() > 44);
+    }
+
+    #[test]
+    fn ensure_video_has_audio_adds_silent_track_for_video_only_input() {
+        if which("ffmpeg").is_err() || which("ffprobe").is_err() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let output_path = dir.path().join("with-audio.mp4");
+        super::ensure_video_has_audio(
+            std::path::Path::new("tests/output/filter.mp4"),
+            &output_path,
+        )
+        .unwrap();
+
+        assert!(output_path.is_file(), "expected muxed mp4 to be created");
+        assert!(super::has_audio_stream(&output_path).unwrap());
     }
 
     #[test]
