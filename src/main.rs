@@ -5788,6 +5788,32 @@ mod tests {
         );
     }
 
+    fn build_video_only_fixture(dir: &TempDir) -> std::path::PathBuf {
+        let ffmpeg = which("ffmpeg").unwrap();
+        let video_path = dir.path().join("video-only.mp4");
+        let status = std::process::Command::new(ffmpeg)
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=640x360:rate=25")
+            .arg("-t")
+            .arg("2")
+            .arg("-an")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg(&video_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "expected ffmpeg to create video-only fixture");
+        video_path
+    }
+
     #[test]
     fn extract_audio_falls_back_to_silence_for_video_only_input() {
         if which("ffmpeg").is_err() || which("ffprobe").is_err() {
@@ -5795,8 +5821,9 @@ mod tests {
         }
 
         let dir = TempDir::new().unwrap();
+        let video_path = build_video_only_fixture(&dir);
         let wav_path = dir.path().join("audio.wav");
-        super::extract_audio(std::path::Path::new("tests/output/filter.mp4"), &wav_path).unwrap();
+        super::extract_audio(&video_path, &wav_path).unwrap();
         assert!(wav_path.is_file(), "expected fallback wav to be created");
         assert!(std::fs::metadata(&wav_path).unwrap().len() > 44);
     }
@@ -5808,12 +5835,9 @@ mod tests {
         }
 
         let dir = TempDir::new().unwrap();
+        let video_path = build_video_only_fixture(&dir);
         let output_path = dir.path().join("with-audio.mp4");
-        super::ensure_video_has_audio(
-            std::path::Path::new("tests/output/filter.mp4"),
-            &output_path,
-        )
-        .unwrap();
+        super::ensure_video_has_audio(&video_path, &output_path).unwrap();
 
         assert!(output_path.is_file(), "expected muxed mp4 to be created");
         assert!(super::has_audio_stream(&output_path).unwrap());
