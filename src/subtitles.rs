@@ -4,6 +4,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::runtime::command_output_checked;
+
 #[derive(Clone, Debug)]
 pub struct SubtitleStyle {
     pub font: String,
@@ -74,15 +76,6 @@ fn normalize_windows_extended_prefix(path: &str) -> String {
     }
 }
 
-fn run_command_capture(cmd: &mut Command, context_msg: &str) -> Result<()> {
-    let output = cmd.output().with_context(|| context_msg.to_string())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{}: {}", context_msg, stderr.trim());
-    }
-    Ok(())
-}
-
 fn convert_srt_to_ass(srt_path: &Path) -> Result<PathBuf> {
     let ffmpeg = which::which("ffmpeg").context("ffmpeg not found in PATH")?;
     let ass_path = srt_path.with_extension("ass");
@@ -94,16 +87,23 @@ fn convert_srt_to_ass(srt_path: &Path) -> Result<PathBuf> {
         .arg("-i")
         .arg(srt_path)
         .arg(&ass_path);
-    run_command_capture(&mut cmd, "converting srt to ass with ffmpeg")?;
+    command_output_checked(&mut cmd, "converting srt to ass with ffmpeg")?;
     Ok(ass_path)
 }
 
 fn ass_bool(value: bool) -> i32 {
-    if value { -1 } else { 0 }
+    if value {
+        -1
+    } else {
+        0
+    }
 }
 
 fn ass_escape_text(value: &str) -> String {
-    value.replace('\\', r"\\").replace('{', r"\{").replace('}', r"\}")
+    value
+        .replace('\\', r"\\")
+        .replace('{', r"\{")
+        .replace('}', r"\}")
 }
 
 fn estimate_syllables(word: &str) -> usize {
@@ -131,7 +131,11 @@ fn estimate_syllables(word: &str) -> usize {
 
 fn beat_duration_cs(word: &str, preset: SubtitleAnimationPreset, beat_sync: bool) -> usize {
     if !beat_sync {
-        return if preset == SubtitleAnimationPreset::CreatorPro { 11 } else { 10 };
+        return if preset == SubtitleAnimationPreset::CreatorPro {
+            11
+        } else {
+            10
+        };
     }
     let syllables = estimate_syllables(word);
     let punctuation_bonus = if word.ends_with([',', ';', ':']) {
@@ -146,9 +150,10 @@ fn beat_duration_cs(word: &str, preset: SubtitleAnimationPreset, beat_sync: bool
 
 fn line_break_indices(words: &[&str], preset: SubtitleAnimationPreset) -> HashSet<usize> {
     let max_words_per_line = match preset {
-        SubtitleAnimationPreset::CreatorPro | SubtitleAnimationPreset::Impact => 3usize,
-        SubtitleAnimationPreset::Emphasis => 4usize,
-        _ => 5usize,
+        SubtitleAnimationPreset::CreatorPro => 5usize,
+        SubtitleAnimationPreset::Impact => 4usize,
+        SubtitleAnimationPreset::Emphasis => 5usize,
+        _ => 6usize,
     };
     let mut breaks = HashSet::new();
     let mut current_count = 0usize;
@@ -238,7 +243,10 @@ fn animate_ass_text(
         let beat_cs = beat_duration_cs(word, preset, options.beat_sync);
         match preset {
             SubtitleAnimationPreset::Karaoke => {
-                out.push_str(&format!(r"{{\1c{}\k{}}}{}", style.highlight_color, beat_cs, escaped));
+                out.push_str(&format!(
+                    r"{{\1c{}\k{}}}{}",
+                    style.highlight_color, beat_cs, escaped
+                ));
             }
             SubtitleAnimationPreset::Emphasis => {
                 out.push_str(&format!(
@@ -260,7 +268,7 @@ fn animate_ass_text(
             }
             SubtitleAnimationPreset::CreatorPro => {
                 out.push_str(&format!(
-                    r"{{\1c{}\k{}\bord6\shad0\blur1\fscx90\fscy90\t(0,70,\fscx148\fscy148)\t(70,170,\fscx100\fscy100)}}{}",
+                    r"{{\1c{}\k{}\bord4\shad0\blur1\fscx95\fscy95\t(0,70,\fscx122\fscy122)\t(70,160,\fscx100\fscy100)}}{}",
                     style.highlight_color, beat_cs, escaped
                 ));
             }
@@ -279,7 +287,8 @@ fn apply_animation_to_ass(
     if preset == SubtitleAnimationPreset::None {
         return Ok(());
     }
-    let raw = std::fs::read_to_string(ass_path).with_context(|| format!("read ass file {}", ass_path.display()))?;
+    let raw = std::fs::read_to_string(ass_path)
+        .with_context(|| format!("read ass file {}", ass_path.display()))?;
     let mut updated = Vec::new();
     let mut dialogue_index = 0usize;
     for line in raw.lines() {
@@ -289,7 +298,9 @@ fn apply_animation_to_ass(
                 let text = line[prefix_end + 1..].trim();
                 let animated = animate_ass_text(text, preset, style, options);
                 let emoji = if options.emoji_layer {
-                    emoji_for_text(text).map(|icon| format!(r"{{\fscx95\fscy95\alpha&H08&}}{icon} ")).unwrap_or_default()
+                    emoji_for_text(text)
+                        .map(|icon| format!(r"{{\fscx95\fscy95\alpha&H08&}}{icon} "))
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -324,7 +335,8 @@ fn apply_animation_to_ass(
 }
 
 fn apply_style_to_ass(ass_path: &Path, style: &SubtitleStyle) -> Result<()> {
-    let raw = std::fs::read_to_string(ass_path).with_context(|| format!("read ass file {}", ass_path.display()))?;
+    let raw = std::fs::read_to_string(ass_path)
+        .with_context(|| format!("read ass file {}", ass_path.display()))?;
     let mut updated = Vec::new();
     let mut replaced = false;
     for line in raw.lines() {
@@ -369,17 +381,17 @@ pub fn burn_subtitles_via_ass(
     let ass_path = convert_srt_to_ass(srt_path).context("SRT->ASS conversion failed")?;
     let fallback_style = SubtitleStyle {
         font: "Arial".to_string(),
-        size: 28,
+        size: 24,
         color: "&H00FFFFFF".to_string(),
         highlight_color: "&H0000F6FF".to_string(),
         outline_color: "&H00000000".to_string(),
-        back_color: "&H64000000".to_string(),
+        back_color: "&H38000000".to_string(),
         outline: 2,
         shadow: 0,
         border_style: 1,
         bold: false,
         alignment: 2,
-        margin_v: 28,
+        margin_v: 72,
     };
     let style_ref = style.unwrap_or(&fallback_style);
     let fallback_render = SubtitleRenderOptions::default();
@@ -452,7 +464,10 @@ pub fn burn_subtitles(
         style.margin_v
     );
     let force_style_escaped = force_style.replace('\'', r"\'");
-    let filter = format!("subtitles='{}':force_style='{}'", srt_escaped, force_style_escaped);
+    let filter = format!(
+        "subtitles='{}':force_style='{}'",
+        srt_escaped, force_style_escaped
+    );
 
     let mut cmd = Command::new(&ffmpeg);
     cmd.arg("-hide_banner")
@@ -530,8 +545,7 @@ mod tests {
                 scene_score: 0.85,
             },
         );
-        assert!(animated.contains(r"\t(0,70,\fscx148\fscy148)"));
+        assert!(animated.contains(r"\t(0,70,\fscx122\fscy122)"));
         assert!(animated.contains(r"\k"));
-        assert!(animated.contains(r"\N"));
     }
 }

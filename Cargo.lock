@@ -780,6 +780,7 @@ dependencies = [
  "csv",
  "env_logger",
  "hound",
+ "log",
  "rayon",
  "regex",
  "serde",

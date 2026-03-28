@@ -4,28 +4,41 @@ use clap::{ArgAction, ArgGroup, Parser};
 use colored::*;
 use csv::WriterBuilder;
 use hound::WavReader;
+use log::{error, info, warn};
 use rayon::prelude::*;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use which::which;
 
-use viralclip_swarm::ai::{build_storyboard, rerank_candidates, write_storyboard, AiClipContext, AiOptions};
+use viralclip_swarm::ai::{
+    build_storyboard, rerank_candidates, write_storyboard, AiClipContext, AiOptions,
+};
+use viralclip_swarm::model::{
+    ApiClientRecord, ApiJobStatus, ApiPrincipal, ApiQuotaState, ApiRunResponse, ApiSecurityConfig,
+    BenchmarkLog, ClipTask, ClipTiming, CropPlan, ExportBundle, ExportClipBundle, JobMap,
+    PlatformExport, ProcessingContext, ProcessingOptions, ProofReport, QuotaLock, RateLimitMap,
+    RunSummary, TranscriptEntry, WindowMetrics,
+};
+use viralclip_swarm::runtime::{
+    command_output_checked, constant_time_eq, normalize_sha256_hex, sha256_hex,
+};
 use viralclip_swarm::subtitles::{
-    burn_subtitles, burn_subtitles_via_ass, SubtitleAnimationPreset, SubtitleRenderOptions, SubtitleStyle,
+    burn_subtitles, burn_subtitles_via_ass, SubtitleAnimationPreset, SubtitleRenderOptions,
+    SubtitleStyle,
 };
 
 #[derive(Parser, Debug)]
@@ -121,11 +134,11 @@ struct Cli {
     subtitle_preset: String,
     #[arg(long, default_value = "none", value_parser = ["none", "karaoke", "emphasis", "impact", "pulse", "creator_pro"])]
     subtitle_animation: String,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     subtitle_emoji_layer: bool,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     subtitle_beat_sync: bool,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     subtitle_scene_fx: bool,
     #[arg(long, default_value_t = false)]
     motion: bool,
@@ -207,105 +220,6 @@ struct Cli {
     allowed_input_exts: String,
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     secure_temp_cleanup: bool,
-}
-
-#[derive(Clone, Debug)]
-struct WindowMetrics {
-    start_sec: f32,
-    energy: f32,
-    laughter: f32,
-    motion: f32,
-    chat: f32,
-    transcript: f32,
-    hook: f32,
-    semantic: f32,
-    speech_confidence: f32,
-    face_score: f32,
-    transcript_density: f32,
-    transcript_text: String,
-    score: f32,
-}
-
-#[derive(Clone, Debug)]
-struct ClipTask {
-    clip_id: usize,
-    start_sec: f32,
-    end_sec: f32,
-    metrics: WindowMetrics,
-}
-
-#[derive(Clone, Debug)]
-struct CropPlan {
-    width: u32,
-    height: u32,
-    x: u32,
-    y: u32,
-}
-
-#[derive(Clone, Debug)]
-struct ProcessingOptions {
-    min_duration: f32,
-    accurate: bool,
-    crop: bool,
-    crop_mode: String,
-    subtitles_mode: String,
-    subtitle_preset: String,
-    subtitle_animation: String,
-    subtitle_emoji_layer: bool,
-    subtitle_beat_sync: bool,
-    subtitle_scene_fx: bool,
-    output_dir: String,
-    timestamp_mode: String,
-}
-
-#[derive(Clone, Debug)]
-struct ProcessingContext {
-    video_path: PathBuf,
-    temp_path: PathBuf,
-    full_srt: Option<PathBuf>,
-    subtitle_styles: HashMap<usize, SubtitleStyle>,
-    processing: ProcessingOptions,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct ClipTiming {
-    clip_id: usize,
-    start_sec: f32,
-    duration: f32,
-    energy_score: f32,
-    laughter_score: f32,
-    motion_score: f32,
-    chat_score: f32,
-    transcript_score: f32,
-    hook_score: f32,
-    transcript_density: f32,
-    readability_score: f32,
-    total_score: f32,
-    extract_ms: u128,
-    subtitles_ms: u128,
-    crop_ms: u128,
-    total_ms: u128,
-    success: bool,
-    duplicate_of: Option<usize>,
-    error: String,
-    timestamp: String,
-    timestamp_human: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct RunSummary {
-    run_timestamp: String,
-    run_timestamp_human: String,
-    total_clips: usize,
-    successful_clips: usize,
-    failed_clips: usize,
-    total_duration_ms: u128,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct BenchmarkLog {
-    summary: RunSummary,
-    clips: Vec<ClipTiming>,
 }
 
 #[derive(Deserialize)]
@@ -410,131 +324,102 @@ struct ConfigFile {
     secure_temp_cleanup: Option<bool>,
 }
 
-#[derive(Clone, Debug)]
-struct TranscriptEntry {
-    start_sec: f32,
-    end_sec: f32,
-    text: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ExportBundle {
-    generated_at: String,
-    generated_at_human: String,
-    clips: Vec<ExportClipBundle>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ExportClipBundle {
-    clip_id: usize,
-    file_name: String,
-    start_sec: f32,
-    duration_sec: f32,
-    total_score: f32,
-    transcript_score: f32,
-    hook_score: f32,
-    readability_score: f32,
-    platforms: Vec<PlatformExport>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct PlatformExport {
-    platform: String,
-    title: String,
-    caption: String,
-    hashtags: Vec<String>,
-    aspect_ratio: String,
-    recommended_duration_sec: u32,
-}
-
-#[derive(Serialize)]
-struct ApiRunResponse {
-    ok: bool,
-    message: String,
-    benchmark_path: String,
-    output_dir: String,
-    summary: Option<RunSummary>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ApiJobStatus {
-    job_id: usize,
-    status: String,
-    message: String,
-    benchmark_path: Option<String>,
-    output_dir: Option<String>,
-    summary: Option<RunSummary>,
-    #[serde(skip_serializing)]
-    owner_client_id: String,
-}
-
-type JobMap = Arc<Mutex<HashMap<usize, ApiJobStatus>>>;
-type RateLimitMap = Arc<Mutex<HashMap<String, Vec<Instant>>>>;
-type QuotaLock = Arc<Mutex<()>>;
-
-#[derive(Clone, Debug)]
-struct ApiSecurityConfig {
-    raw_api_key: Option<String>,
-    token_sha256_hex: Option<String>,
-    max_body_bytes: usize,
-    rate_limit_per_minute: u32,
-    clients: Vec<ApiClientRecord>,
-    allow_url_input: bool,
-    max_queued_jobs: u32,
-    audit_log_path: PathBuf,
-    read_timeout_secs: u64,
-    write_timeout_secs: u64,
-    max_header_line_bytes: usize,
-    url_allowlist: Vec<String>,
-    url_dns_guard: bool,
-    malware_scan_cmd: Option<String>,
-    quota_store_path: PathBuf,
-    client_daily_quota_runs: u32,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ApiClientRecord {
-    client_id: String,
-    token_sha256: String,
-    scopes: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct ApiPrincipal {
-    client_id: String,
-    scopes: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ApiQuotaState {
-    day_utc: String,
-    clients: HashMap<String, u32>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProofReport {
-    generated_at: String,
-    generated_at_human: String,
-    benchmark_path: String,
-    output_dir: String,
-    success_rate: f32,
-    average_total_score: f32,
-    average_readability_score: f32,
-    average_extract_ms: f32,
-    average_total_ms: f32,
-    best_clip_id: Option<usize>,
-    best_clip_score: f32,
-    highlights: Vec<String>,
-}
+type JobSender = mpsc::SyncSender<(usize, Cli)>;
 
 fn find_yt_dlp() -> Result<PathBuf> {
     which("yt-dlp").context("yt-dlp not found in PATH. Please install it.")
 }
 
-fn sha256_hex(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+fn transcript_cleanup_regexes() -> (
+    &'static Regex,
+    &'static Regex,
+    &'static Regex,
+    &'static Regex,
+    &'static Regex,
+) {
+    static TIMESTAMP_RE: OnceLock<Regex> = OnceLock::new();
+    static INDEX_RE: OnceLock<Regex> = OnceLock::new();
+    static ARROW_RE: OnceLock<Regex> = OnceLock::new();
+    static LEADING_INDEX_RE: OnceLock<Regex> = OnceLock::new();
+    static WS_RE: OnceLock<Regex> = OnceLock::new();
+    (
+        TIMESTAMP_RE.get_or_init(|| {
+            Regex::new(r"\b\d{2}:\d{2}:\d{2},\d{3}\b").expect("timestamp cleanup regex is valid")
+        }),
+        INDEX_RE.get_or_init(|| Regex::new(r"^\d+$").expect("index cleanup regex is valid")),
+        ARROW_RE.get_or_init(|| Regex::new(r"\s*-->\s*").expect("arrow cleanup regex is valid")),
+        LEADING_INDEX_RE
+            .get_or_init(|| Regex::new(r"^\d+\s+").expect("leading index regex is valid")),
+        WS_RE.get_or_init(|| Regex::new(r"\s+").expect("whitespace cleanup regex is valid")),
+    )
+}
+
+fn srt_parse_regexes() -> (&'static Regex, &'static Regex) {
+    static TIMESTAMP_RE: OnceLock<Regex> = OnceLock::new();
+    static INDEX_RE: OnceLock<Regex> = OnceLock::new();
+    (
+        TIMESTAMP_RE.get_or_init(|| {
+            Regex::new(
+                r"^(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})$",
+            )
+            .expect("srt timestamp regex is valid")
+        }),
+        INDEX_RE.get_or_init(|| Regex::new(r"^\d+$").expect("srt index regex is valid")),
+    )
+}
+
+fn transcript_token_regex() -> &'static Regex {
+    static TOKEN_RE: OnceLock<Regex> = OnceLock::new();
+    TOKEN_RE.get_or_init(|| Regex::new(r"[A-Za-z0-9']+").expect("token regex is valid"))
+}
+
+fn signalstats_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"lavfi\.signalstats\.YAVG=([0-9.]+)").expect("signalstats regex is valid")
+    })
+}
+
+fn face_center_regexes() -> &'static [Regex; 3] {
+    static RE: OnceLock<[Regex; 3]> = OnceLock::new();
+    RE.get_or_init(|| {
+        [
+            Regex::new(r"x[:=]\s*(\d+)\s*y[:=]\s*(\d+)\s*w[:=]\s*(\d+)\s*h[:=]\s*(\d+)")
+                .expect("face regex 1"),
+            Regex::new(r"face.*?x[:=]\s*(\d+).*?y[:=]\s*(\d+).*?w[:=]\s*(\d+).*?h[:=]\s*(\d+)")
+                .expect("face regex 2"),
+            Regex::new(
+                r"left[:=]\s*(\d+).*?top[:=]\s*(\d+).*?width[:=]\s*(\d+).*?height[:=]\s*(\d+)",
+            )
+            .expect("face regex 3"),
+        ]
+    })
+}
+
+fn cropdetect_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"crop=(\d+):(\d+):(\d+):(\d+)").expect("cropdetect regex is valid")
+    })
+}
+
+fn scene_pts_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"pts_time:([0-9.]+)").expect("scene pts regex is valid"))
+}
+
+fn chat_timestamp_regexes() -> (&'static Regex, &'static Regex) {
+    static TIME_RE: OnceLock<Regex> = OnceLock::new();
+    static NUMERIC_RE: OnceLock<Regex> = OnceLock::new();
+    (
+        TIME_RE.get_or_init(|| {
+            Regex::new(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?)]?")
+                .expect("chat timestamp regex is valid")
+        }),
+        NUMERIC_RE.get_or_init(|| {
+            Regex::new(r"^(\d+(?:\.\d+)?)").expect("numeric chat timestamp regex is valid")
+        }),
+    )
 }
 
 fn parse_allowed_extensions(raw: &str) -> Vec<String> {
@@ -542,6 +427,13 @@ fn parse_allowed_extensions(raw: &str) -> Vec<String> {
         .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+#[derive(Clone, Debug)]
+struct UrlTarget {
+    scheme: String,
+    host: String,
+    port: u16,
 }
 
 fn parse_host_allowlist(raw: &str) -> Vec<String> {
@@ -563,23 +455,21 @@ fn is_supported_media_extension(path: &Path, allowed: &[String]) -> bool {
     allowed.iter().any(|candidate| candidate == &ext)
 }
 
-fn extract_host_from_http_url(url: &str) -> Result<String> {
+fn parse_http_url_target(url: &str) -> Result<UrlTarget> {
     let trimmed = url.trim();
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         anyhow::bail!("URL must include scheme (http:// or https://)");
     };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+    let normalized_scheme = scheme.to_ascii_lowercase();
+    if !matches!(normalized_scheme.as_str(), "http" | "https") {
         anyhow::bail!("Only http:// and https:// URLs are allowed for API jobs");
     }
 
-    let authority = rest
-        .split(&['/', '?', '#'][..])
-        .next()
-        .unwrap_or_default();
-    let host_port = authority
-        .rsplit_once('@')
-        .map(|(_, host)| host)
-        .unwrap_or(authority);
+    let authority = rest.split(&['/', '?', '#'][..]).next().unwrap_or_default();
+    if authority.contains('@') {
+        anyhow::bail!("URLs with embedded credentials are not allowed");
+    }
+    let host_port = authority.trim();
     if host_port.is_empty() {
         anyhow::bail!("URL host is required");
     }
@@ -591,14 +481,41 @@ fn extract_host_from_http_url(url: &str) -> Result<String> {
         if host.is_empty() {
             anyhow::bail!("URL host is required");
         }
-        return Ok(host.to_ascii_lowercase());
+        let port = match host_port[end + 1..].strip_prefix(':') {
+            Some(port) => port.parse::<u16>().context("parse IPv6 URL port")?,
+            None => default_port_for_scheme(&normalized_scheme),
+        };
+        return Ok(UrlTarget {
+            scheme: normalized_scheme,
+            host: host.to_ascii_lowercase(),
+            port,
+        });
     }
 
-    let host = host_port.split(':').next().unwrap_or_default().trim();
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
+            (host.trim(), port.parse::<u16>().context("parse URL port")?)
+        }
+        _ => (
+            host_port.trim(),
+            default_port_for_scheme(&normalized_scheme),
+        ),
+    };
     if host.is_empty() {
         anyhow::bail!("URL host is required");
     }
-    Ok(host.to_ascii_lowercase())
+    Ok(UrlTarget {
+        scheme: normalized_scheme,
+        host: host.to_ascii_lowercase(),
+        port,
+    })
+}
+
+fn default_port_for_scheme(scheme: &str) -> u16 {
+    match scheme {
+        "http" => 80,
+        _ => 443,
+    }
 }
 
 fn host_matches_allowlist(host: &str, allowlist: &[String]) -> bool {
@@ -648,26 +565,60 @@ fn validate_api_input_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_api_aux_input_file(path: &Path, max_bytes: u64, label: &str) -> Result<()> {
+    validate_api_input_path(path)?;
+    if !path.is_file() {
+        anyhow::bail!(
+            "API {} path is not a regular file: {}",
+            label,
+            path.display()
+        );
+    }
+    if path.to_string_lossy().starts_with("\\\\") {
+        anyhow::bail!("UNC/network paths are not allowed for API {} files", label);
+    }
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("read API {} metadata {}", label, path.display()))?;
+    if metadata.len() > max_bytes {
+        anyhow::bail!(
+            "API {} file is too large (> {} bytes): {}",
+            label,
+            max_bytes,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn validate_api_url(url: &str, allowlist: &[String], dns_guard: bool) -> Result<()> {
-    let host = extract_host_from_http_url(url)?;
-    if !host_matches_allowlist(&host, allowlist) {
-        anyhow::bail!("URL host is not in api_url_allowlist: {host}");
+    let target = parse_http_url_target(url)?;
+    if !host_matches_allowlist(&target.host, allowlist) {
+        anyhow::bail!("URL host is not in api_url_allowlist: {}", target.host);
+    }
+    let expected_port = default_port_for_scheme(&target.scheme);
+    if target.port != expected_port {
+        anyhow::bail!(
+            "Custom URL ports are not allowed for API jobs (expected {} for {})",
+            expected_port,
+            target.scheme
+        );
     }
 
     if !dns_guard {
         return Ok(());
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Ok(ip) = target.host.parse::<IpAddr>() {
         if ip_disallowed_for_url_target(ip) {
             anyhow::bail!("URL IP target is not allowed: {ip}");
         }
         return Ok(());
     }
 
-    let resolved: Vec<IpAddr> = (host.as_str(), 443)
+    let resolved: Vec<IpAddr> = (target.host.as_str(), target.port)
         .to_socket_addrs()
-        .with_context(|| format!("resolve URL host {host}"))?
+        .with_context(|| format!("resolve URL host {}", target.host))?
         .map(|socket| socket.ip())
         .collect();
     if resolved.is_empty() {
@@ -681,12 +632,12 @@ fn validate_api_url(url: &str, allowlist: &[String], dns_guard: bool) -> Result<
 
 fn validate_input_file_path(path: &Path, max_bytes: u64, allowed_exts: &[String]) -> Result<()> {
     if !path.is_file() {
-        anyhow::bail!("Input file not found or not a regular file: {}", path.display());
+        anyhow::bail!(
+            "Input file not found or not a regular file: {}",
+            path.display()
+        );
     }
-    if path
-        .to_string_lossy()
-        .starts_with("\\\\")
-    {
+    if path.to_string_lossy().starts_with("\\\\") {
         anyhow::bail!("UNC/network paths are not allowed for input files");
     }
     if !is_supported_media_extension(path, allowed_exts) {
@@ -700,7 +651,11 @@ fn validate_input_file_path(path: &Path, max_bytes: u64, allowed_exts: &[String]
         .metadata()
         .with_context(|| format!("read input metadata {}", path.display()))?;
     if metadata.len() > max_bytes {
-        anyhow::bail!("Input file is too large (> {} bytes): {}", max_bytes, path.display());
+        anyhow::bail!(
+            "Input file is too large (> {} bytes): {}",
+            max_bytes,
+            path.display()
+        );
     }
     Ok(())
 }
@@ -718,7 +673,9 @@ fn validate_api_bind_address(bind_addr: &str) -> Result<()> {
         .parse::<IpAddr>()
         .with_context(|| format!("parse API bind address host from {}", bind_addr))?;
     if !ip.is_loopback() {
-        anyhow::bail!("Refusing non-loopback API bind address without a reverse proxy/TLS layer: {bind_addr}");
+        anyhow::bail!(
+            "Refusing non-loopback API bind address without a reverse proxy/TLS layer: {bind_addr}"
+        );
     }
     Ok(())
 }
@@ -736,6 +693,12 @@ fn check_rate_limit(rate_limits: &RateLimitMap, client_id: &str, per_minute: u32
         .map_err(|_| anyhow::anyhow!("rate limit map poisoned"))?;
     let now = Instant::now();
     let window = Duration::from_secs(60);
+    if guard.len() > 4096 {
+        guard.retain(|_, entries| {
+            entries.retain(|instant| now.duration_since(*instant) <= window);
+            !entries.is_empty()
+        });
+    }
     let entries = guard.entry(client_id.to_string()).or_default();
     entries.retain(|instant| now.duration_since(*instant) <= window);
     if entries.len() >= per_minute as usize {
@@ -761,12 +724,15 @@ fn extract_api_token(headers: &HashMap<String, String>) -> Option<String> {
         .map(|value| value.to_string())
 }
 
-fn api_request_authorized(headers: &HashMap<String, String>, security: &ApiSecurityConfig) -> Option<ApiPrincipal> {
+fn api_request_authorized(
+    headers: &HashMap<String, String>,
+    security: &ApiSecurityConfig,
+) -> Option<ApiPrincipal> {
     let provided = extract_api_token(headers)?;
     let provided_hash = sha256_hex(&provided);
 
     for client in &security.clients {
-        if provided_hash == client.token_sha256.to_ascii_lowercase() {
+        if constant_time_eq(&provided_hash, &client.token_sha256) {
             return Some(ApiPrincipal {
                 client_id: client.client_id.clone(),
                 scopes: client.scopes.clone(),
@@ -775,7 +741,7 @@ fn api_request_authorized(headers: &HashMap<String, String>, security: &ApiSecur
     }
 
     if let Some(expected_hash) = &security.token_sha256_hex {
-        if provided_hash == expected_hash.to_ascii_lowercase() {
+        if constant_time_eq(&provided_hash, expected_hash) {
             return Some(ApiPrincipal {
                 client_id: "shared-hash-token".to_string(),
                 scopes: vec!["read".to_string(), "run".to_string()],
@@ -783,7 +749,7 @@ fn api_request_authorized(headers: &HashMap<String, String>, security: &ApiSecur
         }
     }
     if let Some(expected_key) = &security.raw_api_key {
-        if provided == *expected_key {
+        if constant_time_eq(&provided, expected_key) {
             return Some(ApiPrincipal {
                 client_id: "shared-raw-token".to_string(),
                 scopes: vec!["read".to_string(), "run".to_string()],
@@ -794,11 +760,13 @@ fn api_request_authorized(headers: &HashMap<String, String>, security: &ApiSecur
 }
 
 fn principal_has_scope(principal: &ApiPrincipal, scope: &str) -> bool {
-    principal.scopes.iter().any(|value| value == scope || value == "admin")
+    principal
+        .scopes
+        .iter()
+        .any(|value| value == scope || value == "admin")
 }
 
-fn validate_api_output_path(path: &str) -> Result<()> {
-    let output_path = Path::new(path);
+fn validate_api_output_path(output_path: &Path) -> Result<()> {
     if output_path.is_absolute() {
         anyhow::bail!("API requests may not use absolute output paths");
     }
@@ -809,7 +777,10 @@ fn validate_api_output_path(path: &str) -> Result<()> {
         anyhow::bail!("API requests may not use parent directory traversal in output paths");
     }
     let normalized = output_path.to_string_lossy().replace('\\', "/");
-    if !(normalized == "output" || normalized.starts_with("./output") || normalized.starts_with("output/")) {
+    if !(normalized == "output"
+        || normalized.starts_with("./output")
+        || normalized.starts_with("output/"))
+    {
         anyhow::bail!("API output paths must stay under ./output");
     }
     Ok(())
@@ -843,16 +814,42 @@ fn validate_api_job_request(cli: &Cli, security: &ApiSecurityConfig) -> Result<(
             validate_api_input_path(input)?;
             validate_input_file_path(input, cli.max_input_bytes, &allowed_exts)?;
         }
-        (None, Some(url)) => validate_api_url(url, &security.url_allowlist, security.url_dns_guard)?,
+        (None, Some(url)) => {
+            validate_api_url(url, &security.url_allowlist, security.url_dns_guard)?
+        }
         (Some(_), Some(_)) => anyhow::bail!("Provide either input or URL, not both for API jobs"),
         (None, None) => anyhow::bail!("API jobs must provide input or URL"),
     }
-    validate_api_output_path(&cli.output_dir)?;
+    validate_api_output_path(Path::new(&cli.output_dir))?;
+    validate_api_output_path(Path::new(&cli.csv_path))?;
+    if let Some(path) = &cli.llm_output {
+        validate_api_output_path(Path::new(path))?;
+    }
+    if let Some(path) = &cli.export_bundle_path {
+        validate_api_output_path(Path::new(path))?;
+    }
+    if let Some(path) = &cli.proof_report_path {
+        validate_api_output_path(Path::new(path))?;
+    }
+    if let Some(path) = &cli.thumbnails_dir {
+        validate_api_output_path(Path::new(path))?;
+    }
+    if let Some(path) = &cli.thumbnail_collage_path {
+        validate_api_output_path(Path::new(path))?;
+    }
+    if let Some(path) = &cli.chat_log {
+        validate_api_aux_input_file(path, cli.max_input_bytes, "chat_log")?;
+    }
+    if let Some(path) = &cli.subtitle_style_map {
+        validate_api_aux_input_file(path, cli.max_input_bytes, "subtitle_style_map")?;
+    }
     Ok(())
 }
 
 fn count_active_jobs(jobs: &JobMap) -> Result<usize> {
-    let guard = jobs.lock().map_err(|_| anyhow::anyhow!("job map poisoned"))?;
+    let guard = jobs
+        .lock()
+        .map_err(|_| anyhow::anyhow!("job map poisoned"))?;
     Ok(guard
         .values()
         .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
@@ -889,11 +886,21 @@ fn append_security_audit_log(
 }
 
 fn load_api_clients_from_env(env_name: &str) -> Result<Vec<ApiClientRecord>> {
-    let Some(raw) = env::var(env_name).ok().filter(|value| !value.trim().is_empty()) else {
+    let Some(raw) = env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
         return Ok(Vec::new());
     };
-    let clients: Vec<ApiClientRecord> =
-        serde_json::from_str(&raw).with_context(|| format!("parse API clients JSON from {}", env_name))?;
+    let mut clients: Vec<ApiClientRecord> = serde_json::from_str(&raw)
+        .with_context(|| format!("parse API clients JSON from {}", env_name))?;
+    for client in &mut clients {
+        if client.client_id.trim().is_empty() {
+            anyhow::bail!("API client_id may not be empty");
+        }
+        client.token_sha256 = normalize_sha256_hex(&client.token_sha256)
+            .with_context(|| format!("invalid token_sha256 for client {}", client.client_id))?;
+    }
     Ok(clients)
 }
 
@@ -908,9 +915,10 @@ fn load_quota_state(path: &Path, day_utc: &str) -> Result<ApiQuotaState> {
             clients: HashMap::new(),
         });
     }
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read quota state {}", path.display()))?;
-    let mut state: ApiQuotaState =
-        serde_json::from_str(&raw).with_context(|| format!("parse quota state {}", path.display()))?;
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read quota state {}", path.display()))?;
+    let mut state: ApiQuotaState = serde_json::from_str(&raw)
+        .with_context(|| format!("parse quota state {}", path.display()))?;
     if state.day_utc != day_utc {
         state.day_utc = day_utc.to_string();
         state.clients.clear();
@@ -926,7 +934,8 @@ fn save_quota_state(path: &Path, state: &ApiQuotaState) -> Result<()> {
         }
     }
     let payload = serde_json::to_string_pretty(state).context("serialize quota state")?;
-    std::fs::write(path, payload).with_context(|| format!("write quota state {}", path.display()))?;
+    std::fs::write(path, payload)
+        .with_context(|| format!("write quota state {}", path.display()))?;
     Ok(())
 }
 
@@ -936,7 +945,9 @@ fn check_and_increment_client_quota(
     client_id: &str,
     limit: u32,
 ) -> Result<bool> {
-    let _guard = lock.lock().map_err(|_| anyhow::anyhow!("quota lock poisoned"))?;
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("quota lock poisoned"))?;
     let day = current_utc_day();
     let mut state = load_quota_state(path, &day)?;
     let entry = state.clients.entry(client_id.to_string()).or_insert(0);
@@ -948,30 +959,69 @@ fn check_and_increment_client_quota(
     Ok(true)
 }
 
+fn parse_command_template(command: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote != Some('\'') => escaped = true,
+            '"' | '\'' => {
+                if quote == Some(ch) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(ch);
+                } else {
+                    current.push(ch);
+                }
+            }
+            ch if ch.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped || quote.is_some() {
+        anyhow::bail!("invalid malware_scan_cmd: unmatched quote or trailing escape");
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        anyhow::bail!("invalid malware_scan_cmd: command is empty");
+    }
+    Ok(tokens)
+}
+
 fn maybe_run_malware_scan(scan_cmd: Option<&str>, target: &Path) -> Result<()> {
     let Some(scan_cmd) = scan_cmd.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let target_str = target.to_string_lossy();
-    let command_line = if scan_cmd.contains("{path}") {
-        scan_cmd.replace("{path}", target_str.as_ref())
-    } else {
-        format!("{scan_cmd} \"{target_str}\"")
-    };
+    let target_str = target.to_string_lossy().to_string();
+    let mut tokens = parse_command_template(scan_cmd)?;
+    let executable = tokens.remove(0);
+    let mut args = tokens
+        .into_iter()
+        .map(|token| token.replace("{path}", &target_str))
+        .collect::<Vec<_>>();
+    if !args.iter().any(|arg| arg.contains(&target_str)) {
+        args.push(target_str.clone());
+    }
 
     println!(
         "{}",
         format!("Running malware scan command for {}", target.display()).cyan()
     );
-    let mut command = if cfg!(target_os = "windows") {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(&command_line);
-        cmd
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&command_line);
-        cmd
-    };
+    let mut command = Command::new(executable);
+    command.args(&args);
     let status = command.status().context("run malware scan command")?;
     if !status.success() {
         anyhow::bail!("malware scan failed for {}", target.display());
@@ -984,7 +1034,12 @@ fn download_video(url: &str, output_dir: &Path) -> Result<PathBuf> {
     let status = Command::new(&yt_dlp)
         .arg(url)
         .arg("-o")
-        .arg(output_dir.join("%(title)s.%(ext)s").to_string_lossy().to_string())
+        .arg(
+            output_dir
+                .join("%(title)s.%(ext)s")
+                .to_string_lossy()
+                .to_string(),
+        )
         .arg("--format")
         .arg("bestvideo+bestaudio/best")
         .arg("--merge-output-format")
@@ -1046,7 +1101,10 @@ fn normalize_scores(values: &[f32]) -> Vec<f32> {
     if (max - min).abs() < f32::EPSILON {
         return vec![0.0; values.len()];
     }
-    values.iter().map(|value| (value - min) / (max - min)).collect()
+    values
+        .iter()
+        .map(|value| (value - min) / (max - min))
+        .collect()
 }
 
 fn analyze_audio_windows(wav_path: &Path, window_secs: f32) -> Result<Vec<WindowMetrics>> {
@@ -1104,7 +1162,11 @@ fn analyze_audio_windows(wav_path: &Path, window_secs: f32) -> Result<Vec<Window
                 .sum::<f32>()
                 / frame_rms.len() as f32;
             let std_dev = variance.sqrt();
-            if mean > 0.0 { std_dev / mean } else { 0.0 }
+            if mean > 0.0 {
+                std_dev / mean
+            } else {
+                0.0
+            }
         };
 
         starts.push(window_idx as f32 * window_secs);
@@ -1243,7 +1305,12 @@ fn format_srt_timestamp(seconds: f32) -> String {
     format!("{hours:02}:{minutes:02}:{secs:02},{millis:03}")
 }
 
-fn extract_srt_segment(full_srt: &Path, start_sec: f32, end_sec: f32, output_srt: &Path) -> Result<()> {
+fn extract_srt_segment(
+    full_srt: &Path,
+    start_sec: f32,
+    end_sec: f32,
+    output_srt: &Path,
+) -> Result<()> {
     let entries = parse_srt_entries(full_srt)?;
     let mut clip_index = 1usize;
     let mut out_blocks = Vec::new();
@@ -1277,12 +1344,7 @@ fn extract_srt_segment(full_srt: &Path, start_sec: f32, end_sec: f32, output_srt
 
 fn clean_transcript_text(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let timestamp_re =
-        Regex::new(r"\b\d{2}:\d{2}:\d{2},\d{3}\b").expect("timestamp cleanup regex is valid");
-    let index_re = Regex::new(r"^\d+$").expect("index cleanup regex is valid");
-    let arrow_re = Regex::new(r"\s*-->\s*").expect("arrow cleanup regex is valid");
-    let leading_index_re = Regex::new(r"^\d+\s+").expect("leading index regex is valid");
-    let ws_re = Regex::new(r"\s+").expect("whitespace cleanup regex is valid");
+    let (timestamp_re, index_re, arrow_re, leading_index_re, ws_re) = transcript_cleanup_regexes();
 
     let mut parts = Vec::new();
     for raw_line in normalized.lines() {
@@ -1305,14 +1367,11 @@ fn clean_transcript_text(text: &str) -> String {
 }
 
 fn parse_srt_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
-    let content = std::fs::read_to_string(path).with_context(|| format!("read transcript {}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read transcript {}", path.display()))?;
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
     let mut entries = Vec::new();
-    let timestamp_re = Regex::new(
-        r"^(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})$",
-    )
-    .expect("srt timestamp regex is valid");
-    let index_re = Regex::new(r"^\d+$").expect("srt index regex is valid");
+    let (timestamp_re, index_re) = srt_parse_regexes();
 
     let mut current_start = None;
     let mut current_end = None;
@@ -1347,7 +1406,12 @@ fn parse_srt_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
         }
 
         if let Some(capture) = timestamp_re.captures(line) {
-            flush_entry(&mut entries, &mut current_start, &mut current_end, &mut current_lines);
+            flush_entry(
+                &mut entries,
+                &mut current_start,
+                &mut current_end,
+                &mut current_lines,
+            );
             current_start = parse_srt_timestamp(&capture["start"]);
             current_end = parse_srt_timestamp(&capture["end"]);
             continue;
@@ -1358,14 +1422,19 @@ fn parse_srt_entries(path: &Path) -> Result<Vec<TranscriptEntry>> {
         }
     }
 
-    flush_entry(&mut entries, &mut current_start, &mut current_end, &mut current_lines);
+    flush_entry(
+        &mut entries,
+        &mut current_start,
+        &mut current_end,
+        &mut current_lines,
+    );
 
     Ok(entries)
 }
 
 fn transcript_tokens(text: &str) -> Vec<String> {
-    let re = Regex::new(r"[A-Za-z0-9']+").expect("token regex is valid");
-    re.find_iter(text)
+    transcript_token_regex()
+        .find_iter(text)
         .map(|m| m.as_str().to_ascii_lowercase())
         .filter(|token| token.len() > 1)
         .collect()
@@ -1374,12 +1443,33 @@ fn transcript_tokens(text: &str) -> Vec<String> {
 fn estimate_hook_signal(text: &str) -> f32 {
     let lower = text.to_ascii_lowercase();
     let hooks = [
-        "how", "why", "secret", "mistake", "crazy", "wild", "unbelievable", "never", "best",
-        "worst", "don't", "do not", "should", "hack", "truth", "exposed", "imagine", "wait",
+        "how",
+        "why",
+        "secret",
+        "mistake",
+        "crazy",
+        "wild",
+        "unbelievable",
+        "never",
+        "best",
+        "worst",
+        "don't",
+        "do not",
+        "should",
+        "hack",
+        "truth",
+        "exposed",
+        "imagine",
+        "wait",
     ];
     let hook_hits = hooks.iter().filter(|hook| lower.contains(**hook)).count() as f32;
-    let punctuation_bonus = lower.matches('?').count() as f32 * 0.35 + lower.matches('!').count() as f32 * 0.25;
-    let number_bonus = if lower.chars().any(|ch| ch.is_ascii_digit()) { 0.35 } else { 0.0 };
+    let punctuation_bonus =
+        lower.matches('?').count() as f32 * 0.35 + lower.matches('!').count() as f32 * 0.25;
+    let number_bonus = if lower.chars().any(|ch| ch.is_ascii_digit()) {
+        0.35
+    } else {
+        0.0
+    };
     hook_hits + punctuation_bonus + number_bonus
 }
 
@@ -1387,7 +1477,10 @@ fn unique_token_ratio(tokens: &[String]) -> f32 {
     if tokens.is_empty() {
         return 0.0;
     }
-    let unique = tokens.iter().collect::<std::collections::HashSet<_>>().len() as f32;
+    let unique = tokens
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len() as f32;
     unique / tokens.len() as f32
 }
 
@@ -1419,7 +1512,13 @@ fn estimate_semantic_signal(text: &str) -> f32 {
         "but", "instead", "except", "until", "however", "finally", "suddenly", "then",
     ];
     let payoff_terms = [
-        "because", "so", "therefore", "that's why", "this is why", "which means", "turns out",
+        "because",
+        "so",
+        "therefore",
+        "that's why",
+        "this is why",
+        "which means",
+        "turns out",
     ];
     let direct_terms = ["you", "your", "here's", "watch", "listen", "look"];
     let stakes_terms = [
@@ -1430,8 +1529,13 @@ fn estimate_semantic_signal(text: &str) -> f32 {
         terms.iter().filter(|term| lower.contains(**term)).count() as f32
     };
 
-    let punctuation = lower.matches('?').count() as f32 * 0.35 + lower.matches('!').count() as f32 * 0.20;
-    let numeric = if lower.chars().any(|ch| ch.is_ascii_digit()) { 0.35 } else { 0.0 };
+    let punctuation =
+        lower.matches('?').count() as f32 * 0.35 + lower.matches('!').count() as f32 * 0.20;
+    let numeric = if lower.chars().any(|ch| ch.is_ascii_digit()) {
+        0.35
+    } else {
+        0.0
+    };
 
     (count_matches(&contrast_terms) * 0.55)
         + (count_matches(&payoff_terms) * 0.65)
@@ -1477,10 +1581,16 @@ fn estimate_music_noise_penalty(text: &str, density: f32) -> f32 {
 
     let repeated = repeated_phrase_penalty(&tokens);
     let non_alpha_ratio = 1.0
-        - (text.chars().filter(|ch| ch.is_ascii_alphabetic() || ch.is_whitespace()).count() as f32
+        - (text
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic() || ch.is_whitespace())
+            .count() as f32
             / text.chars().count().max(1) as f32);
     let lyric_markers = ["oh", "yeah", "la", "na", "woah", "ooh", "uh"];
-    let lyric_hits = lyric_markers.iter().filter(|term| lower.contains(**term)).count() as f32;
+    let lyric_hits = lyric_markers
+        .iter()
+        .filter(|term| lower.contains(**term))
+        .count() as f32;
     let density_penalty = if density > 6.5 {
         ((density - 6.5) / 4.0).clamp(0.0, 1.0)
     } else {
@@ -1515,48 +1625,104 @@ fn overlap_duration(start_a: f32, end_a: f32, start_b: f32, end_b: f32) -> f32 {
     (end_a.min(end_b) - start_a.max(start_b)).max(0.0)
 }
 
-fn transcript_excerpt_for_range(entries: &[TranscriptEntry], start: f32, end: f32, max_words: usize) -> String {
-    let mut pieces = Vec::new();
-    for entry in entries {
-        if overlap_duration(start, end, entry.start_sec, entry.end_sec) <= 0.0 {
-            continue;
-        }
-        if pieces.last().is_some_and(|existing: &String| existing == &entry.text) {
-            continue;
-        }
-        pieces.push(entry.text.clone());
-    }
-
-    let mut words = Vec::new();
-    for piece in pieces {
-        for word in transcript_tokens(&piece) {
-            words.push(word);
-            if words.len() >= max_words {
-                return words.join(" ");
-            }
-        }
-    }
-    words.join(" ")
+struct TranscriptEntryStats<'a> {
+    entry: &'a TranscriptEntry,
+    word_count: usize,
 }
 
-fn transcript_density_for_range(entries: &[TranscriptEntry], start: f32, end: f32) -> f32 {
+fn analyze_transcript_window(
+    entry_stats: &[TranscriptEntryStats<'_>],
+    start: f32,
+    end: f32,
+    excerpt_words: usize,
+) -> (f32, String, String) {
     let window_duration = (end - start).max(0.001);
     let mut effective_words = 0.0f32;
+    let mut combined_text = String::new();
+    let mut excerpt = String::new();
+    let mut excerpt_count = 0usize;
+    let mut last_text: Option<&str> = None;
 
-    for entry in entries {
+    for stat in entry_stats {
+        let entry = stat.entry;
         let overlap = overlap_duration(start, end, entry.start_sec, entry.end_sec);
         if overlap <= 0.0 {
             continue;
         }
+
         let entry_duration = (entry.end_sec - entry.start_sec).max(0.001);
-        let words = transcript_tokens(&entry.text).len() as f32;
-        effective_words += words * (overlap / entry_duration);
+        effective_words += stat.word_count as f32 * (overlap / entry_duration);
+
+        if !combined_text.is_empty() {
+            combined_text.push(' ');
+        }
+        combined_text.push_str(&entry.text);
+
+        if last_text == Some(entry.text.as_str()) {
+            continue;
+        }
+        last_text = Some(entry.text.as_str());
+
+        if excerpt_count >= excerpt_words {
+            continue;
+        }
+        for word in transcript_token_regex().find_iter(&entry.text) {
+            let token = word.as_str().to_ascii_lowercase();
+            if token.len() <= 1 {
+                continue;
+            }
+            if !excerpt.is_empty() {
+                excerpt.push(' ');
+            }
+            excerpt.push_str(&token);
+            excerpt_count += 1;
+            if excerpt_count >= excerpt_words {
+                break;
+            }
+        }
     }
 
-    effective_words / window_duration
+    (effective_words / window_duration, combined_text, excerpt)
 }
 
-fn apply_transcript_scores(windows: &mut [WindowMetrics], entries: &[TranscriptEntry], window_secs: f32) {
+fn transcript_excerpt_for_range(
+    entries: &[TranscriptEntry],
+    start: f32,
+    end: f32,
+    max_words: usize,
+) -> String {
+    let entry_stats = entries
+        .iter()
+        .map(|entry| TranscriptEntryStats {
+            entry,
+            word_count: transcript_token_regex()
+                .find_iter(&entry.text)
+                .filter(|token| token.as_str().len() > 1)
+                .count(),
+        })
+        .collect::<Vec<_>>();
+    analyze_transcript_window(&entry_stats, start, end, max_words).2
+}
+
+fn transcript_density_for_range(entries: &[TranscriptEntry], start: f32, end: f32) -> f32 {
+    let entry_stats = entries
+        .iter()
+        .map(|entry| TranscriptEntryStats {
+            entry,
+            word_count: transcript_token_regex()
+                .find_iter(&entry.text)
+                .filter(|token| token.as_str().len() > 1)
+                .count(),
+        })
+        .collect::<Vec<_>>();
+    analyze_transcript_window(&entry_stats, start, end, 0).0
+}
+
+fn apply_transcript_scores(
+    windows: &mut [WindowMetrics],
+    entries: &[TranscriptEntry],
+    window_secs: f32,
+) {
     if windows.is_empty() || entries.is_empty() {
         return;
     }
@@ -1567,16 +1733,22 @@ fn apply_transcript_scores(windows: &mut [WindowMetrics], entries: &[TranscriptE
     let mut semantic_raw = Vec::with_capacity(windows.len());
     let mut speech_raw = Vec::with_capacity(windows.len());
     let mut texts = Vec::with_capacity(windows.len());
+    let entry_stats = entries
+        .iter()
+        .map(|entry| TranscriptEntryStats {
+            entry,
+            word_count: transcript_token_regex()
+                .find_iter(&entry.text)
+                .filter(|token| token.as_str().len() > 1)
+                .count(),
+        })
+        .collect::<Vec<_>>();
 
     for window in windows.iter() {
         let start = window.start_sec;
         let end = start + window_secs;
-        let relevant: Vec<&TranscriptEntry> = entries
-            .iter()
-            .filter(|entry| entry.start_sec < end && entry.end_sec > start)
-            .collect();
-
-        if relevant.is_empty() {
+        let (density, text, excerpt) = analyze_transcript_window(&entry_stats, start, end, 16);
+        if text.is_empty() {
             transcript_raw.push(0.0);
             density_raw.push(0.0);
             hook_raw.push(0.0);
@@ -1586,27 +1758,22 @@ fn apply_transcript_scores(windows: &mut [WindowMetrics], entries: &[TranscriptE
             continue;
         }
 
-        let text = relevant
-            .iter()
-            .map(|entry| entry.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
         let tokens = transcript_tokens(&text);
-        let density = transcript_density_for_range(entries, start, end);
         let hook = estimate_hook_signal(&text);
         let lexical_variety = unique_token_ratio(&tokens);
         let semantic = estimate_semantic_signal(&text);
         let speech_confidence = estimate_speech_confidence(&text, density);
         let noise_penalty = estimate_music_noise_penalty(&text, density);
-        let transcript_signal =
-            ((density * 0.30) + (lexical_variety * 1.10) + (semantic * 0.90)) * (0.25 + (speech_confidence * 0.75));
+        let transcript_signal = ((density * 0.30) + (lexical_variety * 1.10) + (semantic * 0.90))
+            * (0.25 + (speech_confidence * 0.75));
 
         transcript_raw.push((transcript_signal * (1.0 - (noise_penalty * 0.70))).max(0.0));
         density_raw.push(density);
-        hook_raw.push((hook * (0.30 + (speech_confidence * 0.70))) * (1.0 - (noise_penalty * 0.55)));
+        hook_raw
+            .push((hook * (0.30 + (speech_confidence * 0.70))) * (1.0 - (noise_penalty * 0.55)));
         semantic_raw.push((semantic * (1.0 - (noise_penalty * 0.45))).max(0.0));
         speech_raw.push(speech_confidence);
-        texts.push(transcript_excerpt_for_range(entries, start, end, 16));
+        texts.push(excerpt);
     }
 
     let transcript_norm = normalize_scores(&transcript_raw);
@@ -1643,8 +1810,8 @@ fn transcript_similarity(lhs: &str, rhs: &str) -> f32 {
 
 fn probe_video_dimensions(video_path: &Path) -> Result<(u32, u32)> {
     let ffprobe = which("ffprobe").context("ffprobe not found in PATH")?;
-    let output = Command::new(&ffprobe)
-        .arg("-v")
+    let mut cmd = Command::new(&ffprobe);
+    cmd.arg("-v")
         .arg("error")
         .arg("-select_streams")
         .arg("v:0")
@@ -1652,9 +1819,8 @@ fn probe_video_dimensions(video_path: &Path) -> Result<(u32, u32)> {
         .arg("stream=width,height")
         .arg("-of")
         .arg("default=noprint_wrappers=1")
-        .arg(video_path)
-        .output()
-        .context("running ffprobe for dimensions")?;
+        .arg(video_path);
+    let output = command_output_checked(&mut cmd, "running ffprobe for dimensions")?;
 
     let stdout = String::from_utf8(output.stdout).context("ffprobe output not utf8")?;
     let mut width = None;
@@ -1675,20 +1841,15 @@ fn probe_video_dimensions(video_path: &Path) -> Result<(u32, u32)> {
 
 fn probe_video_duration(video_path: &Path) -> Result<f32> {
     let ffprobe = which("ffprobe").context("ffprobe not found in PATH")?;
-    let output = Command::new(&ffprobe)
-        .arg("-v")
+    let mut cmd = Command::new(&ffprobe);
+    cmd.arg("-v")
         .arg("error")
         .arg("-show_entries")
         .arg("format=duration")
         .arg("-of")
         .arg("default=noprint_wrappers=1:nokey=1")
-        .arg(video_path)
-        .output()
-        .context("running ffprobe for duration")?;
-
-    if !output.status.success() {
-        anyhow::bail!("ffprobe duration probe failed");
-    }
+        .arg(video_path);
+    let output = command_output_checked(&mut cmd, "running ffprobe for duration")?;
 
     let stdout = String::from_utf8(output.stdout).context("ffprobe duration output not utf8")?;
     stdout
@@ -1738,14 +1899,19 @@ fn sample_candidate_crop_positions(width: u32, crop_width: u32, samples: usize) 
     positions
 }
 
-fn estimate_crop_activity(video_path: &Path, crop_width: u32, height: u32, crop_x: u32) -> Result<f32> {
+fn estimate_crop_activity(
+    video_path: &Path,
+    crop_width: u32,
+    height: u32,
+    crop_x: u32,
+) -> Result<f32> {
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
     let filter = format!(
         "fps=2,crop={}:{}:{}:0,tblend=all_mode=difference,signalstats,metadata=mode=print",
         crop_width, height, crop_x
     );
-    let output = Command::new(&ffmpeg)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
         .arg("-t")
@@ -1758,15 +1924,15 @@ fn estimate_crop_activity(video_path: &Path, crop_width: u32, height: u32, crop_
         .arg("24")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .with_context(|| format!("running ffmpeg motion probe for crop x={crop_x}"))?;
+        .arg("-");
+    let output = command_output_checked(
+        &mut cmd,
+        &format!("running ffmpeg motion probe for crop x={crop_x}"),
+    )?;
 
     let stderr = String::from_utf8(output.stderr).context("ffmpeg motion probe output not utf8")?;
-    let re = Regex::new(r"lavfi\.signalstats\.YAVG=([0-9.]+)").context("compile signalstats regex")?;
-
     let mut values = Vec::new();
-    for capture in re.captures_iter(&stderr) {
+    for capture in signalstats_regex().captures_iter(&stderr) {
         if let Ok(value) = capture[1].parse::<f32>() {
             values.push(value);
         }
@@ -1779,7 +1945,12 @@ fn estimate_crop_activity(video_path: &Path, crop_width: u32, height: u32, crop_
     Ok(values.iter().sum::<f32>() / values.len() as f32)
 }
 
-fn detect_activity_center(video_path: &Path, width: u32, height: u32, crop_width: u32) -> Result<Option<u32>> {
+fn detect_activity_center(
+    video_path: &Path,
+    width: u32,
+    height: u32,
+    crop_width: u32,
+) -> Result<Option<u32>> {
     if crop_width >= width {
         return Ok(None);
     }
@@ -1800,15 +1971,9 @@ fn detect_activity_center(video_path: &Path, width: u32, height: u32, crop_width
 }
 
 fn parse_face_centers(stderr: &str, scale_ratio: f32) -> Vec<u32> {
-    let patterns = [
-        Regex::new(r"x[:=]\s*(\d+)\s*y[:=]\s*(\d+)\s*w[:=]\s*(\d+)\s*h[:=]\s*(\d+)").expect("face regex 1"),
-        Regex::new(r"face.*?x[:=]\s*(\d+).*?y[:=]\s*(\d+).*?w[:=]\s*(\d+).*?h[:=]\s*(\d+)").expect("face regex 2"),
-        Regex::new(r"left[:=]\s*(\d+).*?top[:=]\s*(\d+).*?width[:=]\s*(\d+).*?height[:=]\s*(\d+)").expect("face regex 3"),
-    ];
-
     let mut centers = Vec::new();
     for line in stderr.lines() {
-        for re in &patterns {
+        for re in face_center_regexes() {
             if let Some(capture) = re.captures(line) {
                 let x = capture[1].parse::<f32>().ok();
                 let w = capture[3].parse::<f32>().ok();
@@ -1829,9 +1994,13 @@ fn face_detection_count(stderr: &str) -> usize {
     parse_face_centers(stderr, 1.0).len()
 }
 
-fn estimate_face_presence_for_range(video_path: &Path, start_sec: f32, duration_sec: f32) -> Result<f32> {
+fn estimate_face_presence_for_range(
+    video_path: &Path,
+    start_sec: f32,
+    duration_sec: f32,
+) -> Result<f32> {
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
-    let probe_duration = duration_sec.max(0.6).min(4.0);
+    let probe_duration = duration_sec.clamp(0.6, 4.0);
     let output = Command::new(&ffmpeg)
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -1856,18 +2025,19 @@ fn estimate_face_presence_for_range(video_path: &Path, start_sec: f32, duration_
         return Ok(0.0);
     }
 
-    let stderr = String::from_utf8(output.stderr).context("ffmpeg face presence output not utf8")?;
+    let stderr =
+        String::from_utf8(output.stderr).context("ffmpeg face presence output not utf8")?;
     let detections = face_detection_count(&stderr) as f32;
     Ok((detections / 4.0).clamp(0.0, 1.0))
 }
 
 fn detect_face_center(video_path: &Path, width: u32) -> Result<Option<u32>> {
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
-    let scaled_width = width.min(640).max(160);
+    let scaled_width = width.clamp(160, 640);
     let scale_ratio = width as f32 / scaled_width as f32;
     let filter = format!("fps=2,scale={scaled_width}:-2,facedetect=mode=accurate:resize=320");
-    let output = Command::new(&ffmpeg)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
         .arg("-t")
@@ -1880,15 +2050,14 @@ fn detect_face_center(video_path: &Path, width: u32) -> Result<Option<u32>> {
         .arg("24")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .context("running ffmpeg face detection")?;
+        .arg("-");
+    let output = match command_output_checked(&mut cmd, "running ffmpeg face detection") {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
 
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stderr = String::from_utf8(output.stderr).context("ffmpeg face detection output not utf8")?;
+    let stderr =
+        String::from_utf8(output.stderr).context("ffmpeg face detection output not utf8")?;
     let mut centers = parse_face_centers(&stderr, scale_ratio);
     if centers.is_empty() {
         return Ok(None);
@@ -1917,14 +2086,18 @@ fn detect_face_crop_plan(video_path: &Path, width: u32, height: u32) -> Result<O
     }))
 }
 
-fn detect_subject_crop_plan(video_path: &Path, width: u32, height: u32) -> Result<Option<CropPlan>> {
+fn detect_subject_crop_plan(
+    video_path: &Path,
+    width: u32,
+    height: u32,
+) -> Result<Option<CropPlan>> {
     if let Some(face_plan) = detect_face_crop_plan(video_path, width, height)? {
         return Ok(Some(face_plan));
     }
 
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
-    let output = Command::new(&ffmpeg)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
         .arg("-i")
@@ -1935,13 +2108,11 @@ fn detect_subject_crop_plan(video_path: &Path, width: u32, height: u32) -> Resul
         .arg("180")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .context("running ffmpeg cropdetect for subject-aware crop")?;
+        .arg("-");
+    let output =
+        command_output_checked(&mut cmd, "running ffmpeg cropdetect for subject-aware crop")?;
 
     let stderr = String::from_utf8(output.stderr).context("ffmpeg cropdetect output not utf8")?;
-    let re = Regex::new(r"crop=(\d+):(\d+):(\d+):(\d+)").context("compile cropdetect regex")?;
-
     let target_width = ((height as f32) * 9.0 / 16.0).round() as u32;
     let crop_width = width.min(target_width.max(1));
     if crop_width >= width {
@@ -1949,7 +2120,7 @@ fn detect_subject_crop_plan(video_path: &Path, width: u32, height: u32) -> Resul
     }
 
     let mut cropdetect_centers = Vec::new();
-    for capture in re.captures_iter(&stderr) {
+    for capture in cropdetect_regex().captures_iter(&stderr) {
         let detected_width = capture[1].parse::<u32>().unwrap_or(width);
         let detected_x = capture[3].parse::<u32>().unwrap_or(0);
         if detected_width == 0 {
@@ -2028,7 +2199,10 @@ fn crop_to_vertical(video_path: &Path, output_path: &Path, crop_mode: &str) -> R
 
 fn transcribe_with_local_whisper(audio_path: &Path, srt_path: &Path, cli: &Cli) -> Result<()> {
     if cli.whisper_mode == "python" {
-        println!("{}", "Using Whisper via Python (python -m whisper)...".green());
+        println!(
+            "{}",
+            "Using Whisper via Python (python -m whisper)...".green()
+        );
         let python = which("python").context("python not found in PATH")?;
         let status = Command::new(&python)
             .arg("-m")
@@ -2096,6 +2270,7 @@ fn transcribe_with_openai(audio_path: &Path, srt_path: &Path, cli: &Cli) -> Resu
     let curl = which("curl").context("curl not found in PATH")?;
     let output = Command::new(&curl)
         .arg("-sS")
+        .arg("-f")
         .arg("https://api.openai.com/v1/audio/transcriptions")
         .arg("-H")
         .arg(format!("Authorization: Bearer {api_key}"))
@@ -2115,16 +2290,19 @@ fn transcribe_with_openai(audio_path: &Path, srt_path: &Path, cli: &Cli) -> Resu
         );
     }
 
-    let body = String::from_utf8(output.stdout).context("OpenAI transcription response not utf8")?;
+    let body =
+        String::from_utf8(output.stdout).context("OpenAI transcription response not utf8")?;
     let content = if body.trim_start().starts_with('{') {
-        let parsed: Value = serde_json::from_str(&body).context("parse OpenAI transcription JSON")?;
+        let parsed: Value =
+            serde_json::from_str(&body).context("parse OpenAI transcription JSON")?;
         parse_openai_transcription_srt(&parsed)
             .or_else(|| parsed.as_str().map(|value| value.to_string()))
             .context("OpenAI transcription response did not include SRT text")?
     } else {
         body
     };
-    std::fs::write(srt_path, content).with_context(|| format!("write cloud SRT {}", srt_path.display()))?;
+    std::fs::write(srt_path, content)
+        .with_context(|| format!("write cloud SRT {}", srt_path.display()))?;
     Ok(())
 }
 
@@ -2138,8 +2316,8 @@ fn transcribe_full_audio(audio_path: &Path, srt_path: &Path, cli: &Cli) -> Resul
 
 fn detect_scene_changes(video_path: &Path, threshold: f64) -> Result<Vec<f32>> {
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
-    let output = Command::new(&ffmpeg)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
         .arg("-i")
@@ -2148,15 +2326,13 @@ fn detect_scene_changes(video_path: &Path, threshold: f64) -> Result<Vec<f32>> {
         .arg(format!("select='gt(scene,{threshold})',showinfo"))
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .context("running ffmpeg for scene detection")?;
+        .arg("-");
+    let output = command_output_checked(&mut cmd, "running ffmpeg for scene detection")?;
 
     let stderr = String::from_utf8(output.stderr).context("ffmpeg stderr not utf8")?;
-    let re = Regex::new(r"pts_time:([0-9.]+)").context("compile regex")?;
     let mut timestamps = Vec::new();
     for line in stderr.lines() {
-        if let Some(capture) = re.captures(line) {
+        if let Some(capture) = scene_pts_regex().captures(line) {
             if let Ok(timestamp) = capture[1].parse::<f32>() {
                 timestamps.push(timestamp);
             }
@@ -2181,9 +2357,7 @@ fn now_strings(mode: &str) -> (String, String) {
 fn parse_chat_log(path: &Path) -> Result<Vec<f32>> {
     let file = File::open(path).with_context(|| format!("open chat log {}", path.display()))?;
     let reader = BufReader::new(file);
-    let time_pattern =
-        Regex::new(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?)]?").context("compile chat timestamp regex")?;
-    let numeric_pattern = Regex::new(r"^(\d+(?:\.\d+)?)").context("compile numeric chat timestamp regex")?;
+    let (time_pattern, numeric_pattern) = chat_timestamp_regexes();
 
     let mut timestamps = Vec::new();
     for line in reader.lines() {
@@ -2244,7 +2418,11 @@ fn score_windows(windows: &mut [WindowMetrics], cli: &Cli) {
     for window in windows {
         let laughter = if cli.laughter { window.laughter } else { 0.0 };
         let motion = if cli.motion { window.motion } else { 0.0 };
-        let chat = if cli.chat_log.is_some() { window.chat } else { 0.0 };
+        let chat = if cli.chat_log.is_some() {
+            window.chat
+        } else {
+            0.0
+        };
         let semantic_bonus = window.semantic * 0.35;
         let speech_bonus = window.speech_confidence * 0.15;
         window.score = (window.energy * cli.energy_weight)
@@ -2265,15 +2443,18 @@ fn build_tasks(windows: &[WindowMetrics], min_duration: f32, num_clips: usize) -
     let mut selected = Vec::new();
     let min_gap = min_duration.max(1.0);
     for candidate in ranked {
-        let overlaps = selected.iter().any(|existing: &ClipTask| {
-            (existing.start_sec - candidate.start_sec).abs() < min_gap
-        });
+        let overlaps = selected
+            .iter()
+            .any(|existing: &ClipTask| (existing.start_sec - candidate.start_sec).abs() < min_gap);
         if overlaps {
             continue;
         }
 
         let duplicate = selected.iter().any(|existing: &ClipTask| {
-            transcript_similarity(&existing.metrics.transcript_text, &candidate.transcript_text) >= 0.65
+            transcript_similarity(
+                &existing.metrics.transcript_text,
+                &candidate.transcript_text,
+            ) >= 0.65
         });
         if duplicate {
             continue;
@@ -2301,7 +2482,12 @@ fn rerank_selected_tasks(tasks: &mut [ClipTask]) {
         task.metrics.score += face_bonus + semantic_bonus + speech_bonus;
     }
 
-    tasks.sort_by(|lhs, rhs| rhs.metrics.score.partial_cmp(&lhs.metrics.score).unwrap_or(Ordering::Equal));
+    tasks.sort_by(|lhs, rhs| {
+        rhs.metrics
+            .score
+            .partial_cmp(&lhs.metrics.score)
+            .unwrap_or(Ordering::Equal)
+    });
     for (idx, task) in tasks.iter_mut().enumerate() {
         task.clip_id = idx + 1;
     }
@@ -2309,9 +2495,11 @@ fn rerank_selected_tasks(tasks: &mut [ClipTask]) {
 
 fn enrich_selected_tasks_with_multimodal_context(video_path: &Path, tasks: &mut [ClipTask]) {
     for task in tasks.iter_mut() {
-        if let Ok(face_score) =
-            estimate_face_presence_for_range(video_path, task.start_sec, task.end_sec - task.start_sec)
-        {
+        if let Ok(face_score) = estimate_face_presence_for_range(
+            video_path,
+            task.start_sec,
+            task.end_sec - task.start_sec,
+        ) {
             task.metrics.face_score = face_score;
         }
     }
@@ -2333,15 +2521,24 @@ fn rerank_candidate_tasks(
         .collect::<Vec<_>>();
     let contexts = build_ai_clip_contexts(tasks, transcript_entries);
     let reranked = rerank_candidates(ai_options, &transcript_segments, &contexts)?;
-    let score_map: HashMap<usize, f32> = reranked.into_iter().map(|item| (item.clip_id, item.score)).collect();
+    let score_map: HashMap<usize, f32> = reranked
+        .into_iter()
+        .map(|item| (item.clip_id, item.score))
+        .collect();
 
     for task in tasks.iter_mut() {
         let rerank_score = score_map.get(&task.clip_id).copied().unwrap_or(0.0);
         task.metrics.score += rerank_score * 0.55;
-        task.metrics.semantic = ((task.metrics.semantic * 0.7) + (rerank_score * 0.3)).clamp(0.0, 1.0);
+        task.metrics.semantic =
+            ((task.metrics.semantic * 0.7) + (rerank_score * 0.3)).clamp(0.0, 1.0);
     }
 
-    tasks.sort_by(|lhs, rhs| rhs.metrics.score.partial_cmp(&lhs.metrics.score).unwrap_or(Ordering::Equal));
+    tasks.sort_by(|lhs, rhs| {
+        rhs.metrics
+            .score
+            .partial_cmp(&lhs.metrics.score)
+            .unwrap_or(Ordering::Equal)
+    });
     for (idx, task) in tasks.iter_mut().enumerate() {
         task.clip_id = idx + 1;
     }
@@ -2380,59 +2577,59 @@ fn subtitle_style_from_cli(cli: &Cli) -> SubtitleStyle {
         },
         "creator_pro" => SubtitleStyle {
             font: "Arial Black".to_string(),
-            size: 40,
+            size: 30,
             color: "&H00FFFFFF".to_string(),
             highlight_color: "&H0000F6FF".to_string(),
             outline_color: "&H00000000".to_string(),
-            back_color: "&H96000000".to_string(),
-            outline: 6,
-            shadow: 0,
-            border_style: 3,
-            bold: true,
-            alignment: 2,
-            margin_v: 52,
-        },
-        "creator_neon" => SubtitleStyle {
-            font: "Arial Black".to_string(),
-            size: 40,
-            color: "&H00FFFFFF".to_string(),
-            highlight_color: "&H0000FF66".to_string(),
-            outline_color: "&H00000000".to_string(),
-            back_color: "&HA0000000".to_string(),
-            outline: 7,
-            shadow: 0,
-            border_style: 3,
-            bold: true,
-            alignment: 2,
-            margin_v: 52,
-        },
-        "creator_minimal" => SubtitleStyle {
-            font: "Arial".to_string(),
-            size: 34,
-            color: "&H00FFFFFF".to_string(),
-            highlight_color: "&H0000F6FF".to_string(),
-            outline_color: "&H00000000".to_string(),
-            back_color: "&H5A000000".to_string(),
+            back_color: "&H32000000".to_string(),
             outline: 3,
             shadow: 0,
             border_style: 1,
             bold: true,
             alignment: 2,
-            margin_v: 44,
+            margin_v: 84,
         },
-        "creator_bold" => SubtitleStyle {
-            font: "Impact".to_string(),
-            size: 42,
+        "creator_neon" => SubtitleStyle {
+            font: "Arial Black".to_string(),
+            size: 30,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000FF66".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&H36000000".to_string(),
+            outline: 4,
+            shadow: 0,
+            border_style: 1,
+            bold: true,
+            alignment: 2,
+            margin_v: 84,
+        },
+        "creator_minimal" => SubtitleStyle {
+            font: "Arial".to_string(),
+            size: 28,
             color: "&H00FFFFFF".to_string(),
             highlight_color: "&H0000F6FF".to_string(),
             outline_color: "&H00000000".to_string(),
-            back_color: "&HB0000000".to_string(),
-            outline: 8,
+            back_color: "&H24000000".to_string(),
+            outline: 2,
             shadow: 0,
-            border_style: 3,
+            border_style: 1,
             bold: true,
             alignment: 2,
-            margin_v: 56,
+            margin_v: 84,
+        },
+        "creator_bold" => SubtitleStyle {
+            font: "Impact".to_string(),
+            size: 32,
+            color: "&H00FFFFFF".to_string(),
+            highlight_color: "&H0000F6FF".to_string(),
+            outline_color: "&H00000000".to_string(),
+            back_color: "&H42000000".to_string(),
+            outline: 4,
+            shadow: 0,
+            border_style: 1,
+            bold: true,
+            alignment: 2,
+            margin_v: 88,
         },
         _ => classic_defaults.clone(),
     };
@@ -2446,10 +2643,14 @@ fn subtitle_style_from_cli(cli: &Cli) -> SubtitleStyle {
     if cli.subtitle_preset == "classic" || cli.subtitle_color != classic_defaults.color {
         style.color = cli.subtitle_color.clone();
     }
-    if cli.subtitle_preset == "classic" || cli.subtitle_highlight_color != classic_defaults.highlight_color {
+    if cli.subtitle_preset == "classic"
+        || cli.subtitle_highlight_color != classic_defaults.highlight_color
+    {
         style.highlight_color = cli.subtitle_highlight_color.clone();
     }
-    if cli.subtitle_preset == "classic" || cli.subtitle_outline_color != classic_defaults.outline_color {
+    if cli.subtitle_preset == "classic"
+        || cli.subtitle_outline_color != classic_defaults.outline_color
+    {
         style.outline_color = cli.subtitle_outline_color.clone();
     }
     if cli.subtitle_preset == "classic" || cli.subtitle_back_color != classic_defaults.back_color {
@@ -2461,7 +2662,9 @@ fn subtitle_style_from_cli(cli: &Cli) -> SubtitleStyle {
     if cli.subtitle_preset == "classic" || cli.subtitle_shadow != classic_defaults.shadow {
         style.shadow = cli.subtitle_shadow;
     }
-    if cli.subtitle_preset == "classic" || cli.subtitle_border_style != classic_defaults.border_style {
+    if cli.subtitle_preset == "classic"
+        || cli.subtitle_border_style != classic_defaults.border_style
+    {
         style.border_style = cli.subtitle_border_style;
     }
     if cli.subtitle_preset == "classic" || cli.subtitle_bold != classic_defaults.bold {
@@ -2487,7 +2690,9 @@ fn merge_subtitle_style(default_style: &SubtitleStyle, patch: SubtitleStylePatch
         outline_color: patch
             .outline_color
             .unwrap_or_else(|| default_style.outline_color.clone()),
-        back_color: patch.back_color.unwrap_or_else(|| default_style.back_color.clone()),
+        back_color: patch
+            .back_color
+            .unwrap_or_else(|| default_style.back_color.clone()),
         outline: patch.outline.unwrap_or(default_style.outline),
         shadow: patch.shadow.unwrap_or(default_style.shadow),
         border_style: patch.border_style.unwrap_or(default_style.border_style),
@@ -2533,7 +2738,10 @@ fn load_subtitle_styles(cli: &Cli) -> Result<HashMap<usize, SubtitleStyle>> {
     Ok(styles)
 }
 
-fn subtitle_style_for_clip(styles: &HashMap<usize, SubtitleStyle>, clip_id: usize) -> Option<&SubtitleStyle> {
+fn subtitle_style_for_clip(
+    styles: &HashMap<usize, SubtitleStyle>,
+    clip_id: usize,
+) -> Option<&SubtitleStyle> {
     styles.get(&clip_id).or_else(|| styles.get(&0))
 }
 
@@ -2547,8 +2755,12 @@ fn ai_options_from_cli(cli: &Cli) -> AiOptions {
     }
 }
 
-fn build_ai_clip_contexts(tasks: &[ClipTask], transcript_entries: &[TranscriptEntry]) -> Vec<AiClipContext> {
-    tasks.iter()
+fn build_ai_clip_contexts(
+    tasks: &[ClipTask],
+    transcript_entries: &[TranscriptEntry],
+) -> Vec<AiClipContext> {
+    tasks
+        .iter()
         .map(|task| AiClipContext {
             clip_id: task.clip_id,
             start_sec: task.start_sec,
@@ -2558,7 +2770,12 @@ fn build_ai_clip_contexts(tasks: &[ClipTask], transcript_entries: &[TranscriptEn
             laughter: task.metrics.laughter,
             motion: task.metrics.motion,
             chat: task.metrics.chat,
-            transcript_excerpt: transcript_excerpt_for_range(transcript_entries, task.start_sec, task.end_sec, 18),
+            transcript_excerpt: transcript_excerpt_for_range(
+                transcript_entries,
+                task.start_sec,
+                task.end_sec,
+                18,
+            ),
             readability_score: readability_from_density_and_confidence(
                 transcript_density_for_range(transcript_entries, task.start_sec, task.end_sec),
                 task.metrics.speech_confidence,
@@ -2605,7 +2822,10 @@ fn resolve_thumbnail_collage_path(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| resolve_thumbnails_dir(cli).join("collage.jpg"))
 }
 
-fn build_platform_exports(task: &ClipTask, ai_plan: Option<&viralclip_swarm::ai::AiClipPlan>) -> Vec<PlatformExport> {
+fn build_platform_exports(
+    task: &ClipTask,
+    ai_plan: Option<&viralclip_swarm::ai::AiClipPlan>,
+) -> Vec<PlatformExport> {
     let fallback_title = format!("Moment #{:02}", task.clip_id);
     let base_title = ai_plan
         .map(|plan| plan.title.clone())
@@ -2629,7 +2849,11 @@ fn build_platform_exports(task: &ClipTask, ai_plan: Option<&viralclip_swarm::ai:
                 .map(|plan| plan.youtube_shorts_caption.clone())
                 .filter(|caption| !caption.trim().is_empty())
                 .unwrap_or_else(|| format!("{} #shorts", base_caption)),
-            hashtags: vec!["shorts".to_string(), "viralclip".to_string(), "creator".to_string()],
+            hashtags: vec![
+                "shorts".to_string(),
+                "viralclip".to_string(),
+                "creator".to_string(),
+            ],
             aspect_ratio: "9:16".to_string(),
             recommended_duration_sec: (task.end_sec - task.start_sec).max(0.0).round() as u32,
         },
@@ -2651,7 +2875,11 @@ fn build_platform_exports(task: &ClipTask, ai_plan: Option<&viralclip_swarm::ai:
                 .map(|plan| plan.instagram_reels_caption.clone())
                 .filter(|caption| !caption.trim().is_empty())
                 .unwrap_or_else(|| format!("{} #reels", base_caption)),
-            hashtags: vec!["reels".to_string(), "creator".to_string(), "clips".to_string()],
+            hashtags: vec![
+                "reels".to_string(),
+                "creator".to_string(),
+                "clips".to_string(),
+            ],
             aspect_ratio: "9:16".to_string(),
             recommended_duration_sec: (task.end_sec - task.start_sec).max(0.0).round() as u32,
         },
@@ -2672,7 +2900,13 @@ fn write_export_bundle(
     }
 
     let plan_map: HashMap<usize, &viralclip_swarm::ai::AiClipPlan> = storyboard
-        .map(|storyboard| storyboard.clips.iter().map(|plan| (plan.clip_id, plan)).collect())
+        .map(|storyboard| {
+            storyboard
+                .clips
+                .iter()
+                .map(|plan| (plan.clip_id, plan))
+                .collect()
+        })
         .unwrap_or_default();
     let (generated_at, generated_at_human) = now_strings(timestamp_mode);
 
@@ -2718,21 +2952,37 @@ fn build_proof_report(cli: &Cli, benchmark: &BenchmarkLog) -> ProofReport {
     let average_readability_score = if successful.is_empty() {
         0.0
     } else {
-        successful.iter().map(|clip| clip.readability_score).sum::<f32>() / successful.len() as f32
+        successful
+            .iter()
+            .map(|clip| clip.readability_score)
+            .sum::<f32>()
+            / successful.len() as f32
     };
     let average_extract_ms = if successful.is_empty() {
         0.0
     } else {
-        successful.iter().map(|clip| clip.extract_ms as f32).sum::<f32>() / successful.len() as f32
+        successful
+            .iter()
+            .map(|clip| clip.extract_ms as f32)
+            .sum::<f32>()
+            / successful.len() as f32
     };
     let average_total_ms = if successful.is_empty() {
         0.0
     } else {
-        successful.iter().map(|clip| clip.total_ms as f32).sum::<f32>() / successful.len() as f32
+        successful
+            .iter()
+            .map(|clip| clip.total_ms as f32)
+            .sum::<f32>()
+            / successful.len() as f32
     };
     let best_clip = successful
         .iter()
-        .max_by(|lhs, rhs| lhs.total_score.partial_cmp(&rhs.total_score).unwrap_or(Ordering::Equal))
+        .max_by(|lhs, rhs| {
+            lhs.total_score
+                .partial_cmp(&rhs.total_score)
+                .unwrap_or(Ordering::Equal)
+        })
         .copied();
     let (generated_at, generated_at_human) = now_strings(&cli.timestamp_mode);
 
@@ -2818,11 +3068,16 @@ fn write_proof_report(cli: &Cli, benchmark: &BenchmarkLog) -> Result<()> {
             clip.readability_score,
             clip.extract_ms,
             clip.total_ms,
-            if clip.error.is_empty() { "-" } else { &clip.error }
+            if clip.error.is_empty() {
+                "-"
+            } else {
+                &clip.error
+            }
         ));
     }
 
-    std::fs::write(&path, body).with_context(|| format!("write proof report {}", path.display()))?;
+    std::fs::write(&path, body)
+        .with_context(|| format!("write proof report {}", path.display()))?;
     Ok(())
 }
 
@@ -2847,13 +3102,17 @@ fn default_drawtext_font() -> Option<String> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().replace('\\', "/").replace(':', "\\:"))
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .replace(':', "\\:")
+        })
 }
 
 fn extract_single_frame_face_score(video_path: &Path, capture_at: f32) -> Result<f32> {
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
-    let output = Command::new(&ffmpeg)
-        .arg("-hide_banner")
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-hide_banner")
         .arg("-loglevel")
         .arg("info")
         .arg("-ss")
@@ -2866,15 +3125,14 @@ fn extract_single_frame_face_score(video_path: &Path, capture_at: f32) -> Result
         .arg("1")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .output()
-        .context("running ffmpeg single-frame face probe")?;
+        .arg("-");
+    let output = match command_output_checked(&mut cmd, "running ffmpeg single-frame face probe") {
+        Ok(output) => output,
+        Err(_) => return Ok(0.0),
+    };
 
-    if !output.status.success() {
-        return Ok(0.0);
-    }
-
-    let stderr = String::from_utf8(output.stderr).context("single-frame face probe output not utf8")?;
+    let stderr =
+        String::from_utf8(output.stderr).context("single-frame face probe output not utf8")?;
     Ok((face_detection_count(&stderr) as f32).clamp(0.0, 2.0) / 2.0)
 }
 
@@ -2962,7 +3220,10 @@ fn extract_thumbnail_with_style(
         }
     }
 
-    anyhow::bail!("ffmpeg thumbnail extraction failed for {}", video_path.display());
+    anyhow::bail!(
+        "ffmpeg thumbnail extraction failed for {}",
+        video_path.display()
+    );
 }
 
 fn write_thumbnail_collage(cli: &Cli, images: &[PathBuf]) -> Result<()> {
@@ -2986,7 +3247,10 @@ fn write_thumbnail_collage(cli: &Cli, images: &[PathBuf]) -> Result<()> {
 
     let ffmpeg = which("ffmpeg").context("ffmpeg not found in PATH")?;
     let mut cmd = Command::new(&ffmpeg);
-    cmd.arg("-hide_banner").arg("-loglevel").arg("error").arg("-y");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y");
 
     let selected: Vec<&PathBuf> = images.iter().take(4).collect();
     for image in &selected {
@@ -3023,10 +3287,17 @@ fn write_thumbnails(
     storyboard: Option<&viralclip_swarm::ai::AiStoryboard>,
 ) -> Result<()> {
     let dir = resolve_thumbnails_dir(cli);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create thumbnails dir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create thumbnails dir {}", dir.display()))?;
     let mut images = Vec::new();
     let plan_map: HashMap<usize, &viralclip_swarm::ai::AiClipPlan> = storyboard
-        .map(|storyboard| storyboard.clips.iter().map(|plan| (plan.clip_id, plan)).collect())
+        .map(|storyboard| {
+            storyboard
+                .clips
+                .iter()
+                .map(|plan| (plan.clip_id, plan))
+                .collect()
+        })
         .unwrap_or_default();
 
     for clip in benchmark.clips.iter().filter(|clip| clip.success) {
@@ -3069,7 +3340,11 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_flag(&mut args, "--api", config.api);
     push_config_arg(&mut args, "--api-bind", config.api_bind);
     push_config_arg(&mut args, "--url", config.url);
-    push_config_arg(&mut args, "--input", config.input.map(|path| path.display().to_string()));
+    push_config_arg(
+        &mut args,
+        "--input",
+        config.input.map(|path| path.display().to_string()),
+    );
     push_config_arg(&mut args, "--num-clips", config.num_clips);
     push_config_arg(&mut args, "--output-dir", config.output_dir);
     push_config_arg(&mut args, "--min-duration", config.min_duration);
@@ -3079,11 +3354,27 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_flag(&mut args, "--accurate", config.accurate);
     push_config_arg(&mut args, "--whisper-mode", config.whisper_mode);
     push_config_arg(&mut args, "--whisper-model", config.whisper_model);
-    push_config_arg(&mut args, "--transcription-provider", config.transcription_provider);
-    push_config_arg(&mut args, "--cloud-transcription-model", config.cloud_transcription_model);
-    push_config_arg(&mut args, "--transcription-api-key-env", config.transcription_api_key_env);
+    push_config_arg(
+        &mut args,
+        "--transcription-provider",
+        config.transcription_provider,
+    );
+    push_config_arg(
+        &mut args,
+        "--cloud-transcription-model",
+        config.cloud_transcription_model,
+    );
+    push_config_arg(
+        &mut args,
+        "--transcription-api-key-env",
+        config.transcription_api_key_env,
+    );
     push_config_flag(&mut args, "--laughter", config.laughter);
-    push_config_arg(&mut args, "--chat-log", config.chat_log.map(|path| path.display().to_string()));
+    push_config_arg(
+        &mut args,
+        "--chat-log",
+        config.chat_log.map(|path| path.display().to_string()),
+    );
     push_config_arg(&mut args, "--energy-weight", config.energy_weight);
     push_config_arg(&mut args, "--motion-weight", config.motion_weight);
     push_config_arg(&mut args, "--laughter-weight", config.laughter_weight);
@@ -3093,7 +3384,9 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_arg(
         &mut args,
         "--subtitle-style-map",
-        config.subtitle_style_map.map(|path| path.display().to_string()),
+        config
+            .subtitle_style_map
+            .map(|path| path.display().to_string()),
     );
     push_config_arg(&mut args, "--subtitle-font", config.subtitle_font);
     push_config_arg(&mut args, "--subtitle-size", config.subtitle_size);
@@ -3103,17 +3396,33 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
         "--subtitle-highlight-color",
         config.subtitle_highlight_color,
     );
-    push_config_arg(&mut args, "--subtitle-outline-color", config.subtitle_outline_color);
-    push_config_arg(&mut args, "--subtitle-back-color", config.subtitle_back_color);
+    push_config_arg(
+        &mut args,
+        "--subtitle-outline-color",
+        config.subtitle_outline_color,
+    );
+    push_config_arg(
+        &mut args,
+        "--subtitle-back-color",
+        config.subtitle_back_color,
+    );
     push_config_arg(&mut args, "--subtitle-outline", config.subtitle_outline);
     push_config_arg(&mut args, "--subtitle-shadow", config.subtitle_shadow);
-    push_config_arg(&mut args, "--subtitle-border-style", config.subtitle_border_style);
+    push_config_arg(
+        &mut args,
+        "--subtitle-border-style",
+        config.subtitle_border_style,
+    );
     push_config_flag(&mut args, "--subtitle-bold", config.subtitle_bold);
     push_config_arg(&mut args, "--subtitle-alignment", config.subtitle_alignment);
     push_config_arg(&mut args, "--subtitle-margin-v", config.subtitle_margin_v);
     push_config_arg(&mut args, "--subtitle-preset", config.subtitle_preset);
     push_config_arg(&mut args, "--subtitle-animation", config.subtitle_animation);
-    push_config_arg(&mut args, "--subtitle-emoji-layer", config.subtitle_emoji_layer);
+    push_config_arg(
+        &mut args,
+        "--subtitle-emoji-layer",
+        config.subtitle_emoji_layer,
+    );
     push_config_arg(&mut args, "--subtitle-beat-sync", config.subtitle_beat_sync);
     push_config_arg(&mut args, "--subtitle-scene-fx", config.subtitle_scene_fx);
     push_config_flag(&mut args, "--motion", config.motion);
@@ -3136,18 +3445,38 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_arg(&mut args, "--thumbnails-dir", config.thumbnails_dir);
     push_config_arg(&mut args, "--thumbnail-style", config.thumbnail_style);
     push_config_flag(&mut args, "--thumbnail-collage", config.thumbnail_collage);
-    push_config_arg(&mut args, "--thumbnail-collage-path", config.thumbnail_collage_path);
+    push_config_arg(
+        &mut args,
+        "--thumbnail-collage-path",
+        config.thumbnail_collage_path,
+    );
     push_config_arg(&mut args, "--api-key-env", config.api_key_env);
-    push_config_arg(&mut args, "--api-token-sha256-env", config.api_token_sha256_env);
+    push_config_arg(
+        &mut args,
+        "--api-token-sha256-env",
+        config.api_token_sha256_env,
+    );
     push_config_arg(&mut args, "--api-max-body-bytes", config.api_max_body_bytes);
     push_config_arg(
         &mut args,
         "--api-rate-limit-per-minute",
         config.api_rate_limit_per_minute,
     );
-    push_config_arg(&mut args, "--api-clients-json-env", config.api_clients_json_env);
-    push_config_flag(&mut args, "--api-allow-url-input", config.api_allow_url_input);
-    push_config_arg(&mut args, "--api-max-queued-jobs", config.api_max_queued_jobs);
+    push_config_arg(
+        &mut args,
+        "--api-clients-json-env",
+        config.api_clients_json_env,
+    );
+    push_config_flag(
+        &mut args,
+        "--api-allow-url-input",
+        config.api_allow_url_input,
+    );
+    push_config_arg(
+        &mut args,
+        "--api-max-queued-jobs",
+        config.api_max_queued_jobs,
+    );
     push_config_arg(&mut args, "--security-audit-log", config.security_audit_log);
     push_config_arg(&mut args, "--api-quota-store", config.api_quota_store);
     push_config_arg(
@@ -3155,8 +3484,16 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
         "--api-client-daily-quota-runs",
         config.api_client_daily_quota_runs,
     );
-    push_config_arg(&mut args, "--api-read-timeout-secs", config.api_read_timeout_secs);
-    push_config_arg(&mut args, "--api-write-timeout-secs", config.api_write_timeout_secs);
+    push_config_arg(
+        &mut args,
+        "--api-read-timeout-secs",
+        config.api_read_timeout_secs,
+    );
+    push_config_arg(
+        &mut args,
+        "--api-write-timeout-secs",
+        config.api_write_timeout_secs,
+    );
     push_config_arg(
         &mut args,
         "--api-max-header-line-bytes",
@@ -3167,7 +3504,11 @@ fn config_to_args(config: ConfigFile) -> Vec<String> {
     push_config_arg(&mut args, "--malware-scan-cmd", config.malware_scan_cmd);
     push_config_arg(&mut args, "--max-input-bytes", config.max_input_bytes);
     push_config_arg(&mut args, "--allowed-input-exts", config.allowed_input_exts);
-    push_config_arg(&mut args, "--secure-temp-cleanup", config.secure_temp_cleanup);
+    push_config_arg(
+        &mut args,
+        "--secure-temp-cleanup",
+        config.secure_temp_cleanup,
+    );
 
     args
 }
@@ -3311,8 +3652,11 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
     let mut subtitles_ms = 0u128;
     let mut crop_ms = 0u128;
 
-    let raw_clip = context.temp_path.join(format!("clip_{}_raw.mp4", task.clip_id));
-    let final_output = PathBuf::from(&context.processing.output_dir).join(format!("clip_{}.mp4", task.clip_id));
+    let raw_clip = context
+        .temp_path
+        .join(format!("clip_{}_raw.mp4", task.clip_id));
+    let final_output =
+        PathBuf::from(&context.processing.output_dir).join(format!("clip_{}.mp4", task.clip_id));
 
     let extract_started = Instant::now();
     if let Err(error) = extract_clip(
@@ -3335,13 +3679,20 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
     extract_ms = extract_started.elapsed().as_millis();
     println!(
         "{}",
-        format!("Clip {} extracted in {:.2?}", task.clip_id, extract_started.elapsed()).yellow()
+        format!(
+            "Clip {} extracted in {:.2?}",
+            task.clip_id,
+            extract_started.elapsed()
+        )
+        .yellow()
     );
 
     let mut current = raw_clip;
     if let Some(full_srt_path) = context.full_srt.as_ref() {
         let clip_srt = context.temp_path.join(format!("clip_{}.srt", task.clip_id));
-        if let Err(error) = extract_srt_segment(full_srt_path, task.start_sec, task.end_sec, &clip_srt) {
+        if let Err(error) =
+            extract_srt_segment(full_srt_path, task.start_sec, task.end_sec, &clip_srt)
+        {
             return record_failure(
                 task,
                 &context.processing,
@@ -3353,8 +3704,15 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
             );
         }
 
-        if clip_srt.metadata().map(|metadata| metadata.len()).unwrap_or(0) > 0 {
-            let captioned = context.temp_path.join(format!("clip_{}_captioned.mp4", task.clip_id));
+        if clip_srt
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+            > 0
+        {
+            let captioned = context
+                .temp_path
+                .join(format!("clip_{}_captioned.mp4", task.clip_id));
             let subtitle_started = Instant::now();
             let style = subtitle_style_for_clip(&context.subtitle_styles, task.clip_id);
             let animation = subtitle_animation_preset(&context.processing.subtitle_animation);
@@ -3403,17 +3761,16 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
                             Some(&render_options),
                         )
                     } else if let Some(style) = style {
-                        burn_subtitles(&current, &clip_srt, &captioned, style)
-                            .or_else(|_| {
-                                burn_subtitles_via_ass(
-                                    &current,
-                                    &clip_srt,
-                                    &captioned,
-                                    Some(style),
-                                    SubtitleAnimationPreset::None,
-                                    Some(&render_options),
-                                )
-                            })
+                        burn_subtitles(&current, &clip_srt, &captioned, style).or_else(|_| {
+                            burn_subtitles_via_ass(
+                                &current,
+                                &clip_srt,
+                                &captioned,
+                                Some(style),
+                                SubtitleAnimationPreset::None,
+                                Some(&render_options),
+                            )
+                        })
                     } else {
                         burn_subtitles_via_ass(
                             &current,
@@ -3451,14 +3808,20 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
             current = captioned;
             println!(
                 "{}",
-                format!("Subtitles burned for clip {} in {:.2?}", task.clip_id, subtitle_started.elapsed())
-                    .green()
+                format!(
+                    "Subtitles burned for clip {} in {:.2?}",
+                    task.clip_id,
+                    subtitle_started.elapsed()
+                )
+                .green()
             );
         }
     }
 
     if context.processing.crop {
-        let cropped = context.temp_path.join(format!("clip_{}_cropped.mp4", task.clip_id));
+        let cropped = context
+            .temp_path
+            .join(format!("clip_{}_cropped.mp4", task.clip_id));
         let crop_started = Instant::now();
         if let Err(error) = crop_to_vertical(&current, &cropped, &context.processing.crop_mode) {
             return record_failure(
@@ -3475,7 +3838,12 @@ fn process_clip(task: &ClipTask, context: &ProcessingContext) -> ClipTiming {
         current = cropped;
         println!(
             "{}",
-            format!("Clip {} cropped in {:.2?}", task.clip_id, crop_started.elapsed()).green()
+            format!(
+                "Clip {} cropped in {:.2?}",
+                task.clip_id,
+                crop_started.elapsed()
+            )
+            .green()
         );
     }
 
@@ -3556,7 +3924,8 @@ fn write_json_log(path: &Path, benchmark: &BenchmarkLog, append: bool) -> Result
     } else {
         serde_json::to_string_pretty(benchmark)?
     };
-    std::fs::write(path, payload).with_context(|| format!("write benchmark json {}", path.display()))?;
+    std::fs::write(path, payload)
+        .with_context(|| format!("write benchmark json {}", path.display()))?;
     Ok(())
 }
 
@@ -3613,8 +3982,16 @@ fn write_benchmark_log(cli: &Cli, benchmark: &BenchmarkLog) -> Result<()> {
 fn ensure_scoring_enabled(cli: &Cli) -> Result<()> {
     let total_weight = cli.energy_weight
         + if cli.motion { cli.motion_weight } else { 0.0 }
-        + if cli.laughter { cli.laughter_weight } else { 0.0 }
-        + if cli.chat_log.is_some() { cli.chat_weight } else { 0.0 }
+        + if cli.laughter {
+            cli.laughter_weight
+        } else {
+            0.0
+        }
+        + if cli.chat_log.is_some() {
+            cli.chat_weight
+        } else {
+            0.0
+        }
         + cli.transcript_weight
         + cli.hook_weight;
     if total_weight <= 0.0 {
@@ -3686,7 +4063,10 @@ fn prompt_optional_path(prompt: &str) -> Result<Option<String>> {
 }
 
 fn prompt_for_cli() -> Result<Cli> {
-    println!("{}", "No arguments provided. Choose a source to continue.".yellow());
+    println!(
+        "{}",
+        "No arguments provided. Choose a source to continue.".yellow()
+    );
     println!("Enter one source and leave the other blank.");
     let input_path = normalize_prompt_value(read_prompt_line("Local video path: ")?);
     let url = normalize_prompt_value(read_prompt_line("YouTube URL: ")?);
@@ -3749,7 +4129,8 @@ fn prompt_for_cli() -> Result<Cli> {
 
     if captions {
         args.push("--captions".to_string());
-        let transcription_provider = prompt_with_default("Transcription provider (local/openai)", "local")?;
+        let transcription_provider =
+            prompt_with_default("Transcription provider (local/openai)", "local")?;
         args.push("--transcription-provider".to_string());
         args.push(transcription_provider.clone());
         if transcription_provider == "local" {
@@ -3761,7 +4142,8 @@ fn prompt_for_cli() -> Result<Cli> {
             args.push(whisper_model);
         } else {
             let cloud_model = prompt_with_default("Cloud transcription model", "whisper-1")?;
-            let api_key_env = prompt_with_default("Transcription API key env var", "OPENAI_API_KEY")?;
+            let api_key_env =
+                prompt_with_default("Transcription API key env var", "OPENAI_API_KEY")?;
             args.push("--cloud-transcription-model".to_string());
             args.push(cloud_model);
             args.push("--transcription-api-key-env".to_string());
@@ -3865,7 +4247,8 @@ fn prompt_for_cli() -> Result<Cli> {
         } else {
             prompt_with_default("LLM API key env var", "GEMINI_API_KEY")?
         };
-        let output_path = prompt_with_default("AI storyboard output", "./output/ai_storyboard.json")?;
+        let output_path =
+            prompt_with_default("AI storyboard output", "./output/ai_storyboard.json")?;
         args.push("--llm-provider".to_string());
         args.push(provider);
         args.push("--llm-model".to_string());
@@ -3884,7 +4267,8 @@ fn prompt_for_cli() -> Result<Cli> {
     }
     if thumbnails {
         args.push("--thumbnails".to_string());
-        let thumbnail_style = prompt_with_default("Thumbnail style (plain/framed/cinematic)", "framed")?;
+        let thumbnail_style =
+            prompt_with_default("Thumbnail style (plain/framed/cinematic)", "framed")?;
         args.push("--thumbnail-style".to_string());
         args.push(thumbnail_style);
         if prompt_bool("Generate thumbnail collage", true)? {
@@ -3970,14 +4354,21 @@ fn print_run_banner(cli: &Cli) {
     if cli.motion {
         println!(
             "{}",
-            format!("Motion detection enabled (scene threshold: {})", cli.scene_threshold).cyan()
+            format!(
+                "Motion detection enabled (scene threshold: {})",
+                cli.scene_threshold
+            )
+            .cyan()
         );
     }
     if cli.laughter {
         println!("{}", "Laughter detection enabled".cyan());
     }
     if let Some(chat_log) = &cli.chat_log {
-        println!("{}", format!("Chat velocity enabled from {}", chat_log.display()).cyan());
+        println!(
+            "{}",
+            format!("Chat velocity enabled from {}", chat_log.display()).cyan()
+        );
     }
     if cli.llm_enable {
         println!(
@@ -3994,13 +4385,21 @@ fn print_run_banner(cli: &Cli) {
     if cli.export_bundle {
         println!(
             "{}",
-            format!("Export bundle enabled ({})", resolve_export_bundle_path(cli).display()).cyan()
+            format!(
+                "Export bundle enabled ({})",
+                resolve_export_bundle_path(cli).display()
+            )
+            .cyan()
         );
     }
     if cli.proof_report {
         println!(
             "{}",
-            format!("Proof report enabled ({})", resolve_proof_report_path(cli).display()).cyan()
+            format!(
+                "Proof report enabled ({})",
+                resolve_proof_report_path(cli).display()
+            )
+            .cyan()
         );
     }
     if cli.thumbnails {
@@ -4017,7 +4416,11 @@ fn print_run_banner(cli: &Cli) {
     if cli.thumbnail_collage {
         println!(
             "{}",
-            format!("Thumbnail collage enabled ({})", resolve_thumbnail_collage_path(cli).display()).cyan()
+            format!(
+                "Thumbnail collage enabled ({})",
+                resolve_thumbnail_collage_path(cli).display()
+            )
+            .cyan()
         );
     }
     println!(
@@ -4057,21 +4460,30 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
     } else {
         anyhow::bail!("Either --url or --input must be provided");
     };
-    println!("{}", format!("Video ready: {}", video_path.display()).green());
+    println!(
+        "{}",
+        format!("Video ready: {}", video_path.display()).green()
+    );
     maybe_run_malware_scan(cli.malware_scan_cmd.as_deref(), &video_path)?;
 
     let wav_path = temp_path.join("audio.wav");
     let t_audio = Instant::now();
     println!("{}", "Extracting audio...".blue());
     extract_audio(&video_path, &wav_path)?;
-    println!("{}", format!("Audio extracted in {:.2?}", t_audio.elapsed()).green());
+    println!(
+        "{}",
+        format!("Audio extracted in {:.2?}", t_audio.elapsed()).green()
+    );
 
     let full_srt = if cli.captions {
         let srt_path = temp_path.join("full.srt");
         let t_trans = Instant::now();
         println!("{}", "Transcribing audio with Whisper...".green());
         transcribe_full_audio(&wav_path, &srt_path, cli)?;
-        println!("{}", format!("Transcription finished in {:.2?}", t_trans.elapsed()).green());
+        println!(
+            "{}",
+            format!("Transcription finished in {:.2?}", t_trans.elapsed()).green()
+        );
         Some(srt_path)
     } else {
         None
@@ -4085,7 +4497,11 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
         apply_transcript_scores(&mut windows, &transcript_entries, 1.0);
         println!(
             "{}",
-            format!("Transcript-aware scoring enabled from {} entries", transcript_entries.len()).cyan()
+            format!(
+                "Transcript-aware scoring enabled from {} entries",
+                transcript_entries.len()
+            )
+            .cyan()
         );
     }
 
@@ -4105,7 +4521,11 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
 
     score_windows(&mut windows, cli);
     let candidate_pool = ((cli.num_clips as usize).saturating_mul(3)).max(cli.num_clips as usize);
-    let mut tasks = build_tasks(&windows, cli.min_duration, candidate_pool.min(windows.len()));
+    let mut tasks = build_tasks(
+        &windows,
+        cli.min_duration,
+        candidate_pool.min(windows.len()),
+    );
     if tasks.is_empty() {
         anyhow::bail!("No clips selected");
     }
@@ -4133,7 +4553,10 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
 
     std::fs::create_dir_all(&cli.output_dir).context("create output dir")?;
     let subtitle_styles = load_subtitle_styles(cli)?;
-    let storyboard = build_storyboard(&ai_options, &build_ai_clip_contexts(&tasks, &transcript_entries))?;
+    let storyboard = build_storyboard(
+        &ai_options,
+        &build_ai_clip_contexts(&tasks, &transcript_entries),
+    )?;
     if let Some(storyboard) = storyboard.as_ref() {
         let storyboard_path = resolve_llm_output_path(cli);
         write_storyboard(&storyboard_path, storyboard)?;
@@ -4144,8 +4567,16 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
     }
     if cli.export_bundle {
         let bundle_path = resolve_export_bundle_path(cli);
-        write_export_bundle(&bundle_path, &cli.timestamp_mode, &tasks, storyboard.as_ref())?;
-        println!("{}", format!("Export bundle written to {}", bundle_path.display()).cyan());
+        write_export_bundle(
+            &bundle_path,
+            &cli.timestamp_mode,
+            &tasks,
+            storyboard.as_ref(),
+        )?;
+        println!(
+            "{}",
+            format!("Export bundle written to {}", bundle_path.display()).cyan()
+        );
     }
     let context = ProcessingContext {
         video_path: video_path.clone(),
@@ -4169,7 +4600,10 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
     };
 
     println!("{}", "Processing clips in parallel...".yellow());
-    let mut timings: Vec<ClipTiming> = tasks.par_iter().map(|task| process_clip(task, &context)).collect();
+    let mut timings: Vec<ClipTiming> = tasks
+        .par_iter()
+        .map(|task| process_clip(task, &context))
+        .collect();
     timings.sort_by_key(|timing| timing.clip_id);
 
     let successful_clips = timings.iter().filter(|timing| timing.success).count();
@@ -4190,23 +4624,18 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
     if cli.proof_report {
         let proof_path = resolve_proof_report_path(cli);
         write_proof_report(cli, &benchmark)?;
-        println!("{}", format!("Proof report written to {}", proof_path.display()).cyan());
+        println!(
+            "{}",
+            format!("Proof report written to {}", proof_path.display()).cyan()
+        );
     }
     if cli.thumbnails {
         let thumbnails_dir = resolve_thumbnails_dir(cli);
         write_thumbnails(cli, &benchmark, storyboard.as_ref())?;
-        println!("{}", format!("Thumbnails written to {}", thumbnails_dir.display()).cyan());
-    }
-    println!("{}", format!("Completed run in {:.2?}", start_total.elapsed()).green());
-
-    if failed_clips > 0 {
-        let failures = timings
-            .iter()
-            .filter(|timing| !timing.success)
-            .map(|timing| format!("clip {}: {}", timing.clip_id, timing.error))
-            .collect::<Vec<_>>()
-            .join("; ");
-        anyhow::bail!("{} clip(s) failed: {}", failed_clips, failures);
+        println!(
+            "{}",
+            format!("Thumbnails written to {}", thumbnails_dir.display()).cyan()
+        );
     }
 
     if !cli.secure_temp_cleanup {
@@ -4220,6 +4649,21 @@ fn run_with_cli(cli: &Cli) -> Result<BenchmarkLog> {
             )
             .yellow()
         );
+    }
+
+    println!(
+        "{}",
+        format!("Completed run in {:.2?}", start_total.elapsed()).green()
+    );
+
+    if failed_clips > 0 {
+        let failures = timings
+            .iter()
+            .filter(|timing| !timing.success)
+            .map(|timing| format!("clip {}: {}", timing.clip_id, timing.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("{} clip(s) failed: {}", failed_clips, failures);
     }
 
     Ok(benchmark)
@@ -4238,7 +4682,7 @@ fn write_http_response(
     content_type: &str,
 ) -> Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -4260,7 +4704,7 @@ fn write_json_error(stream: &mut TcpStream, status: &str, message: &str) -> Resu
 fn handle_api_connection(
     mut stream: TcpStream,
     jobs: &JobMap,
-    job_tx: &mpsc::Sender<(usize, Cli)>,
+    job_tx: &JobSender,
     next_job_id: &Arc<Mutex<usize>>,
     rate_limits: &RateLimitMap,
     quota_lock: &QuotaLock,
@@ -4270,12 +4714,16 @@ fn handle_api_connection(
         .set_read_timeout(Some(Duration::from_secs(security.read_timeout_secs.max(1))))
         .context("set API read timeout")?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(security.write_timeout_secs.max(1))))
+        .set_write_timeout(Some(Duration::from_secs(
+            security.write_timeout_secs.max(1),
+        )))
         .context("set API write timeout")?;
 
     let mut reader = BufReader::new(stream.try_clone().context("clone TCP stream")?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).context("read request line")?;
+    reader
+        .read_line(&mut request_line)
+        .context("read request line")?;
     if request_line.trim().is_empty() {
         return Ok(());
     }
@@ -4317,7 +4765,7 @@ fn handle_api_connection(
         return Ok(());
     }
 
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     let mut headers = HashMap::new();
     let mut header_count = 0usize;
     loop {
@@ -4351,19 +4799,38 @@ fn handle_api_connection(
                 "rejected",
                 "too many headers",
             );
-            write_json_error(&mut stream, "431 Request Header Fields Too Large", "too many headers")?;
+            write_json_error(
+                &mut stream,
+                "431 Request Header Fields Too Large",
+                "too many headers",
+            )?;
             return Ok(());
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             let key = name.trim().to_ascii_lowercase();
             let value = value.trim().to_string();
             if key == "content-length" {
-                content_length = value.parse::<usize>().unwrap_or(0);
+                let parsed = value.parse::<usize>().ok();
+                if parsed.is_none() {
+                    write_json_error(&mut stream, "400 Bad Request", "invalid content-length")?;
+                    return Ok(());
+                }
+                content_length = parsed;
             }
             headers.insert(key, value);
         }
     }
 
+    if method == "POST" && content_length.is_none() {
+        write_json_error(
+            &mut stream,
+            "411 Length Required",
+            "content-length required",
+        )?;
+        return Ok(());
+    }
+
+    let content_length = content_length.unwrap_or(0);
     if content_length > security.max_body_bytes {
         let _ = append_security_audit_log(
             &security.audit_log_path,
@@ -4372,7 +4839,11 @@ fn handle_api_connection(
             "rejected",
             "request body too large",
         );
-        write_json_error(&mut stream, "413 Payload Too Large", "request body too large")?;
+        write_json_error(
+            &mut stream,
+            "413 Payload Too Large",
+            "request body too large",
+        )?;
         return Ok(());
     }
 
@@ -4380,6 +4851,16 @@ fn handle_api_connection(
     if content_length > 0 {
         use std::io::Read;
         reader.read_exact(&mut body).context("read request body")?;
+    }
+
+    if method == "GET" && path == "/health" {
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "{\"ok\":true,\"status\":\"healthy\"}",
+            "application/json",
+        )?;
+        return Ok(());
     }
 
     let principal = if let Some(principal) = api_request_authorized(&headers, security) {
@@ -4392,14 +4873,15 @@ fn handle_api_connection(
             "rejected",
             "missing or invalid API token",
         );
-        write_json_error(&mut stream, "401 Unauthorized", "missing or invalid x-api-key")?;
+        write_json_error(
+            &mut stream,
+            "401 Unauthorized",
+            "missing or invalid x-api-key",
+        )?;
         return Ok(());
     };
 
     match (method, path) {
-        ("GET", "/health") => {
-            write_http_response(&mut stream, "200 OK", "{\"ok\":true,\"status\":\"healthy\"}", "application/json")?;
-        }
         ("POST", "/run") => {
             if !principal_has_scope(&principal, "run") {
                 let _ = append_security_audit_log(
@@ -4412,8 +4894,14 @@ fn handle_api_connection(
                 write_json_error(&mut stream, "403 Forbidden", "missing run scope")?;
                 return Ok(());
             }
-            let content_type = headers.get("content-type").map(String::as_str).unwrap_or("");
-            if !content_type.to_ascii_lowercase().starts_with("application/json") {
+            let content_type = headers
+                .get("content-type")
+                .map(String::as_str)
+                .unwrap_or("");
+            if !content_type
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+            {
                 let _ = append_security_audit_log(
                     &security.audit_log_path,
                     "request_validation",
@@ -4421,11 +4909,49 @@ fn handle_api_connection(
                     "rejected",
                     "invalid content-type",
                 );
-                write_json_error(&mut stream, "415 Unsupported Media Type", "content-type must be application/json")?;
+                write_json_error(
+                    &mut stream,
+                    "415 Unsupported Media Type",
+                    "content-type must be application/json",
+                )?;
                 return Ok(());
             }
-            let config: ConfigFile = serde_json::from_slice(&body).context("parse API run config JSON")?;
-            let mut cli = cli_from_config(config)?;
+            let config: ConfigFile = match serde_json::from_slice(&body) {
+                Ok(config) => config,
+                Err(error) => {
+                    let _ = append_security_audit_log(
+                        &security.audit_log_path,
+                        "request_validation",
+                        &principal.client_id,
+                        "rejected",
+                        "invalid JSON body",
+                    );
+                    write_json_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        &format!("invalid JSON body: {error}"),
+                    )?;
+                    return Ok(());
+                }
+            };
+            let mut cli = match cli_from_config(config) {
+                Ok(cli) => cli,
+                Err(error) => {
+                    let _ = append_security_audit_log(
+                        &security.audit_log_path,
+                        "request_validation",
+                        &principal.client_id,
+                        "rejected",
+                        "invalid job config",
+                    );
+                    write_json_error(
+                        &mut stream,
+                        "400 Bad Request",
+                        &format!("invalid job config: {error}"),
+                    )?;
+                    return Ok(());
+                }
+            };
             if let Err(error) = validate_api_job_request(&cli, security) {
                 let _ = append_security_audit_log(
                     &security.audit_log_path,
@@ -4462,17 +4988,25 @@ fn handle_api_connection(
                     "rejected",
                     "daily run quota exceeded",
                 );
-                write_json_error(&mut stream, "429 Too Many Requests", "daily run quota exceeded")?;
+                write_json_error(
+                    &mut stream,
+                    "429 Too Many Requests",
+                    "daily run quota exceeded",
+                )?;
                 return Ok(());
             }
             let job_id = {
-                let mut guard = next_job_id.lock().map_err(|_| anyhow::anyhow!("job counter poisoned"))?;
+                let mut guard = next_job_id
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("job counter poisoned"))?;
                 let id = *guard;
                 *guard += 1;
                 id
             };
             {
-                let mut guard = jobs.lock().map_err(|_| anyhow::anyhow!("job map poisoned"))?;
+                let mut guard = jobs
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("job map poisoned"))?;
                 guard.insert(
                     job_id,
                     ApiJobStatus {
@@ -4486,9 +5020,35 @@ fn handle_api_connection(
                     },
                 );
             }
-            job_tx
-                .send((job_id, cli))
-                .context("enqueue API job")?;
+            match job_tx.try_send((job_id, cli)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if let Ok(mut guard) = jobs.lock() {
+                        guard.remove(&job_id);
+                    }
+                    let _ = append_security_audit_log(
+                        &security.audit_log_path,
+                        "queue_limit",
+                        &principal.client_id,
+                        "rejected",
+                        "job queue is full",
+                    );
+                    write_json_error(&mut stream, "503 Service Unavailable", "job queue is full")?;
+                    return Ok(());
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if let Ok(mut guard) = jobs.lock() {
+                        guard.remove(&job_id);
+                    }
+                    error!("API job queue disconnected");
+                    write_json_error(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "job queue unavailable",
+                    )?;
+                    return Ok(());
+                }
+            }
             let _ = append_security_audit_log(
                 &security.audit_log_path,
                 "job_queue",
@@ -4518,7 +5078,9 @@ fn handle_api_connection(
                 write_json_error(&mut stream, "403 Forbidden", "missing read scope")?;
                 return Ok(());
             }
-            let guard = jobs.lock().map_err(|_| anyhow::anyhow!("job map poisoned"))?;
+            let guard = jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job map poisoned"))?;
             let values: Vec<ApiJobStatus> = guard
                 .values()
                 .filter(|job| {
@@ -4543,7 +5105,9 @@ fn handle_api_connection(
                 return Ok(());
             }
             let job_id = path.trim_start_matches("/jobs/").parse::<usize>().ok();
-            let guard = jobs.lock().map_err(|_| anyhow::anyhow!("job map poisoned"))?;
+            let guard = jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job map poisoned"))?;
             if let Some(job_id) = job_id {
                 if let Some(job) = guard.get(&job_id) {
                     if !principal_has_scope(&principal, "admin")
@@ -4555,10 +5119,20 @@ fn handle_api_connection(
                     let body = serde_json::to_string(job).context("serialize job status")?;
                     write_http_response(&mut stream, "200 OK", &body, "application/json")?;
                 } else {
-                    write_http_response(&mut stream, "404 Not Found", "{\"ok\":false,\"message\":\"job not found\"}", "application/json")?;
+                    write_http_response(
+                        &mut stream,
+                        "404 Not Found",
+                        "{\"ok\":false,\"message\":\"job not found\"}",
+                        "application/json",
+                    )?;
                 }
             } else {
-                write_http_response(&mut stream, "400 Bad Request", "{\"ok\":false,\"message\":\"invalid job id\"}", "application/json")?;
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "{\"ok\":false,\"message\":\"invalid job id\"}",
+                    "application/json",
+                )?;
             }
         }
         _ => {
@@ -4577,15 +5151,36 @@ fn run_api_server_with_auth(bind_addr: &str, security: ApiSecurityConfig) -> Res
     let rate_limits: RateLimitMap = Arc::new(Mutex::new(HashMap::new()));
     let quota_lock: QuotaLock = Arc::new(Mutex::new(()));
     let next_job_id = Arc::new(Mutex::new(1usize));
-    let (job_tx, job_rx) = mpsc::channel::<(usize, Cli)>();
-    let jobs_for_worker = Arc::clone(&jobs);
-    let audit_log_path = security.audit_log_path.clone();
-    thread::spawn(move || {
-        while let Ok((job_id, cli)) = job_rx.recv() {
+    let queue_capacity = security.max_queued_jobs.max(1) as usize;
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Cli)>(queue_capacity);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get().clamp(1, 4))
+        .unwrap_or(1);
+    for worker_id in 0..worker_count {
+        let jobs_for_worker = Arc::clone(&jobs);
+        let job_rx = Arc::clone(&job_rx);
+        let audit_log_path = security.audit_log_path.clone();
+        thread::spawn(move || loop {
+            let job = {
+                let receiver = match job_rx.lock() {
+                    Ok(receiver) => receiver,
+                    Err(_) => {
+                        error!("API job receiver lock poisoned");
+                        return;
+                    }
+                };
+                receiver.recv()
+            };
+            let Ok((job_id, cli)) = job else {
+                warn!("API worker {worker_id} exiting because job queue closed");
+                return;
+            };
+
             if let Ok(mut guard) = jobs_for_worker.lock() {
                 if let Some(job) = guard.get_mut(&job_id) {
                     job.status = "running".to_string();
-                    job.message = "job running".to_string();
+                    job.message = format!("job running on worker {worker_id}");
                 }
             }
 
@@ -4624,45 +5219,57 @@ fn run_api_server_with_auth(bind_addr: &str, security: ApiSecurityConfig) -> Res
                     }
                 }
             }
-        }
-    });
+        });
+    }
 
-    println!("{}", format!("API server listening on http://{}", bind_addr).cyan());
-    println!("{}", "Endpoints: GET /health, POST /run, GET /jobs, GET /jobs/{id}".cyan());
+    info!("API server listening on http://{}", bind_addr);
+    info!("API endpoints enabled: GET /health, POST /run, GET /jobs, GET /jobs/{{id}}");
     if security.raw_api_key.is_some() || security.token_sha256_hex.is_some() {
-        println!("{}", "API auth enabled via x-api-key".cyan());
+        info!("API shared-token auth enabled");
     }
     if !security.clients.is_empty() {
-        println!(
-            "{}",
-            format!("API client registry enabled ({} clients)", security.clients.len()).cyan()
+        info!(
+            "API client registry enabled for {} clients",
+            security.clients.len()
         );
     }
+    info!(
+        "API hardening enabled: max_body={} bytes, rate_limit={}/min, daily_quota={} runs/client, queue_capacity={}, workers={}",
+        security.max_body_bytes,
+        security.rate_limit_per_minute,
+        security.client_daily_quota_runs,
+        queue_capacity,
+        worker_count
+    );
     println!(
         "{}",
-        format!(
-            "API hardening enabled: max_body={} bytes, rate_limit={}/min, daily_quota={} runs/client",
-            security.max_body_bytes, security.rate_limit_per_minute, security.client_daily_quota_runs
-        )
-        .cyan()
+        format!("API server listening on http://{}", bind_addr).cyan()
     );
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_api_connection(
-                    stream,
-                    &jobs,
-                    &job_tx,
-                    &next_job_id,
-                    &rate_limits,
-                    &quota_lock,
-                    &security,
-                ) {
-                    eprintln!("API request failed: {error}");
-                }
+                let jobs = Arc::clone(&jobs);
+                let job_tx = job_tx.clone();
+                let next_job_id = Arc::clone(&next_job_id);
+                let rate_limits = Arc::clone(&rate_limits);
+                let quota_lock = Arc::clone(&quota_lock);
+                let security = security.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_api_connection(
+                        stream,
+                        &jobs,
+                        &job_tx,
+                        &next_job_id,
+                        &rate_limits,
+                        &quota_lock,
+                        &security,
+                    ) {
+                        error!("API request failed: {error}");
+                    }
+                });
             }
-            Err(error) => eprintln!("API connection error: {error}"),
+            Err(error) => error!("API connection error: {error}"),
         }
     }
 
@@ -4673,11 +5280,15 @@ fn main() -> Result<()> {
     env_logger::init();
     let cli = cli_from_env()?;
     if cli.api {
-        let raw_api_key = env::var(&cli.api_key_env).ok().filter(|value| !value.trim().is_empty());
+        let raw_api_key = env::var(&cli.api_key_env)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let token_sha256_hex = env::var(&cli.api_token_sha256_env)
             .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| !value.is_empty());
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| normalize_sha256_hex(&value))
+            .transpose()?;
         let security = ApiSecurityConfig {
             raw_api_key,
             token_sha256_hex,
@@ -4705,14 +5316,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_request_authorized, build_proof_report, check_rate_limit, clean_transcript_text,
-        check_and_increment_client_quota,
-        cli_from_args_with_config, cli_from_config, estimate_music_noise_penalty,
-        estimate_speech_confidence, format_srt_timestamp, sha256_hex, parse_clock_timestamp,
-        parse_face_centers, parse_srt_entries, parse_srt_timestamp, readability_from_density,
-        readability_from_density_and_confidence, validate_api_bind_address, validate_api_job_request,
-        BenchmarkLog, Cli, ClipTiming, ConfigFile, RunSummary, ApiClientRecord, ApiSecurityConfig,
-        transcript_similarity, QuotaLock, RateLimitMap,
+        api_request_authorized, build_proof_report, check_and_increment_client_quota,
+        check_rate_limit, clean_transcript_text, cli_from_args_with_config, cli_from_config,
+        estimate_music_noise_penalty, estimate_speech_confidence, format_srt_timestamp,
+        parse_clock_timestamp, parse_command_template, parse_face_centers, parse_srt_entries,
+        parse_srt_timestamp, readability_from_density, readability_from_density_and_confidence,
+        sha256_hex, transcript_density_for_range, transcript_excerpt_for_range,
+        transcript_similarity, validate_api_bind_address, validate_api_job_request,
+        validate_api_url, ApiClientRecord, ApiSecurityConfig, BenchmarkLog, Cli, ClipTiming,
+        ConfigFile, QuotaLock, RateLimitMap, RunSummary,
     };
     use clap::Parser;
     use std::collections::HashMap;
@@ -4751,9 +5363,13 @@ mod tests {
 
     #[test]
     fn noisy_repetitive_text_gets_lower_confidence() {
-        let clean = estimate_speech_confidence("This is the secret to better hooks on short videos", 2.8);
+        let clean =
+            estimate_speech_confidence("This is the secret to better hooks on short videos", 2.8);
         let noisy = estimate_speech_confidence("oh oh oh yeah yeah yeah la la la", 5.8);
-        assert!(clean > noisy, "expected clean speech confidence > noisy confidence");
+        assert!(
+            clean > noisy,
+            "expected clean speech confidence > noisy confidence"
+        );
         assert!(estimate_music_noise_penalty("oh oh oh yeah yeah yeah la la la", 5.8) > 0.4);
     }
 
@@ -4831,6 +5447,28 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_prunes_stale_clients_when_map_is_large() {
+        let now = std::time::Instant::now();
+        let stale = now.checked_sub(std::time::Duration::from_secs(61)).unwrap();
+        let rate_limits: RateLimitMap = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut guard = rate_limits.lock().unwrap();
+            for idx in 0..4097 {
+                guard.insert(format!("client-{idx}"), vec![stale]);
+            }
+        }
+
+        assert!(check_rate_limit(&rate_limits, "fresh-client", 2).unwrap());
+        let guard = rate_limits.lock().unwrap();
+        assert!(
+            guard.len() < 50,
+            "expected stale clients to be pruned, got {}",
+            guard.len()
+        );
+        assert!(guard.contains_key("fresh-client"));
+    }
+
+    #[test]
     fn quota_blocks_after_daily_limit() {
         let temp = TempDir::new().unwrap();
         let quota_file = temp.path().join("quota.json");
@@ -4848,12 +5486,8 @@ mod tests {
 
     #[test]
     fn api_job_validation_rejects_url_when_disabled() {
-        let cli = Cli::try_parse_from([
-            "viralclip-swarm",
-            "--url",
-            "https://example.com/video",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["viralclip-swarm", "--url", "https://example.com/video"]).unwrap();
         let security = ApiSecurityConfig {
             raw_api_key: None,
             token_sha256_hex: None,
@@ -4907,6 +5541,30 @@ mod tests {
     }
 
     #[test]
+    fn api_url_validation_rejects_custom_ports_and_credentials() {
+        assert!(validate_api_url("https://example.com:8443/video", &[], false).is_err());
+        assert!(validate_api_url("https://user:pass@example.com/video", &[], false).is_err());
+        assert!(validate_api_url("https://example.com/video", &[], false).is_ok());
+    }
+
+    #[test]
+    fn malware_scan_template_parser_handles_quotes() {
+        let parts =
+            parse_command_template(r#"scanner --flag "{path}" --label "safe mode""#).unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                "scanner".to_string(),
+                "--flag".to_string(),
+                "{path}".to_string(),
+                "--label".to_string(),
+                "safe mode".to_string()
+            ]
+        );
+        assert!(parse_command_template(r#"scanner "unterminated"#).is_err());
+    }
+
+    #[test]
     fn cli_merges_json_config() {
         let config = NamedTempFile::new().unwrap();
         std::fs::write(
@@ -4933,7 +5591,10 @@ mod tests {
         assert!(cli.captions);
         assert!(cli.export_bundle);
         assert_eq!(cli.min_duration, 7.0);
-        assert_eq!(cli.input.unwrap(), std::path::PathBuf::from("tests/fixtures/sample.mp4"));
+        assert_eq!(
+            cli.input.unwrap(),
+            std::path::PathBuf::from("tests/fixtures/sample.mp4")
+        );
     }
 
     #[test]
@@ -4941,6 +5602,36 @@ mod tests {
         let stderr = "frame:0 face x:120 y:40 w:80 h:80\nface left=240 top=50 width=100 height=100";
         let centers = parse_face_centers(stderr, 2.0);
         assert_eq!(centers, vec![320, 580]);
+    }
+
+    #[test]
+    fn transcript_helpers_preserve_density_and_deduplicate_excerpt() {
+        let entries = vec![
+            super::TranscriptEntry {
+                start_sec: 0.0,
+                end_sec: 4.0,
+                text: "alpha beta gamma delta".to_string(),
+            },
+            super::TranscriptEntry {
+                start_sec: 2.0,
+                end_sec: 6.0,
+                text: "alpha beta gamma delta".to_string(),
+            },
+            super::TranscriptEntry {
+                start_sec: 3.0,
+                end_sec: 5.0,
+                text: "fresh insight lands here".to_string(),
+            },
+        ];
+
+        let excerpt = transcript_excerpt_for_range(&entries, 1.0, 5.0, 6);
+        assert_eq!(excerpt, "alpha beta gamma delta fresh insight");
+
+        let density = transcript_density_for_range(&entries, 1.0, 5.0);
+        assert!(
+            density > 2.4 && density < 2.6,
+            "unexpected density: {density}"
+        );
     }
 
     #[test]
@@ -4960,12 +5651,8 @@ mod tests {
 
     #[test]
     fn proof_report_uses_successful_clips() {
-        let cli = Cli::try_parse_from([
-            "viralclip-swarm",
-            "--input",
-            "tests/fixtures/sample.mp4",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["viralclip-swarm", "--input", "tests/fixtures/sample.mp4"])
+            .unwrap();
         let benchmark = BenchmarkLog {
             summary: RunSummary {
                 run_timestamp: "2026-03-25T00:00:00Z".to_string(),

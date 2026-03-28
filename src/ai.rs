@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+
+use crate::runtime::command_output_checked;
 
 #[derive(Clone, Debug)]
 pub struct AiOptions {
@@ -59,25 +62,33 @@ pub struct RerankResult {
     pub reason: String,
 }
 
-pub fn build_storyboard(options: &AiOptions, clips: &[AiClipContext]) -> Result<Option<AiStoryboard>> {
+pub fn build_storyboard(
+    options: &AiOptions,
+    clips: &[AiClipContext],
+) -> Result<Option<AiStoryboard>> {
     if !options.enabled || clips.is_empty() {
         return Ok(None);
     }
 
     let storyboard = match options.provider.as_str() {
         "heuristic" | "local" => heuristic_storyboard(options, clips),
-        "openai" | "openrouter" | "groq" | "huggingface" | "anthropic" | "gemini" => match cloud_storyboard(options, clips) {
-            Ok(storyboard) => storyboard,
-            Err(error) => {
-                eprintln!(
-                    "AI provider {} failed: {}. Falling back to heuristic plan.",
-                    options.provider, error
-                );
-                heuristic_storyboard(options, clips)
+        "openai" | "openrouter" | "groq" | "huggingface" | "anthropic" | "gemini" => {
+            match cloud_storyboard(options, clips) {
+                Ok(storyboard) => storyboard,
+                Err(error) => {
+                    warn!(
+                        "AI provider {} failed: {}. Falling back to heuristic plan.",
+                        options.provider, error
+                    );
+                    heuristic_storyboard(options, clips)
+                }
             }
-        },
+        }
         other => {
-            eprintln!("Unknown AI provider '{}', using heuristic plan instead.", other);
+            warn!(
+                "Unknown AI provider '{}', using heuristic plan instead.",
+                other
+            );
             heuristic_storyboard(options, clips)
         }
     };
@@ -107,16 +118,20 @@ pub fn rerank_candidates(
     }
 
     match options.provider.as_str() {
-        "openai" | "openrouter" | "groq" | "huggingface" | "anthropic" | "gemini" if options.enabled => match cloud_rerank(options, transcript_segments, clips) {
-            Ok(scores) => Ok(scores),
-            Err(error) => {
-                eprintln!(
-                    "AI reranker {} failed: {}. Falling back to local embedding-style rerank.",
-                    options.provider, error
-                );
-                Ok(local_embedding_rerank(transcript_segments, clips))
+        "openai" | "openrouter" | "groq" | "huggingface" | "anthropic" | "gemini"
+            if options.enabled =>
+        {
+            match cloud_rerank(options, transcript_segments, clips) {
+                Ok(scores) => Ok(scores),
+                Err(error) => {
+                    warn!(
+                        "AI reranker {} failed: {}. Falling back to local embedding-style rerank.",
+                        options.provider, error
+                    );
+                    Ok(local_embedding_rerank(transcript_segments, clips))
+                }
             }
-        },
+        }
         _ => Ok(local_embedding_rerank(transcript_segments, clips)),
     }
 }
@@ -140,12 +155,15 @@ fn provider_chat_url(options: &AiOptions, api_key: &str) -> Result<String> {
     }
 }
 
-fn provider_headers<'a>(options: &AiOptions, api_key: &'a str) -> Vec<(&'static str, String)> {
+fn provider_headers(options: &AiOptions, api_key: &str) -> Vec<(&'static str, String)> {
     match options.provider.as_str() {
         "openai" | "groq" | "huggingface" => vec![("Authorization", format!("Bearer {api_key}"))],
         "openrouter" => vec![
             ("Authorization", format!("Bearer {api_key}")),
-            ("HTTP-Referer", "https://github.com/Gangsworld3/viralclip-swarm".to_string()),
+            (
+                "HTTP-Referer",
+                "https://github.com/Gangsworld3/viralclip-swarm".to_string(),
+            ),
             ("X-OpenRouter-Title", "ViralClip Swarm".to_string()),
         ],
         "anthropic" => vec![
@@ -161,7 +179,9 @@ fn normalize_copy(text: &str) -> String {
     let mut out = String::new();
     let mut last_space = false;
     for ch in text.chars() {
-        let keep = ch.is_ascii_alphanumeric() || ch.is_whitespace() || matches!(ch, '\'' | '?' | '!' | ',' | '.');
+        let keep = ch.is_ascii_alphanumeric()
+            || ch.is_whitespace()
+            || matches!(ch, '\'' | '?' | '!' | ',' | '.');
         if !keep {
             continue;
         }
@@ -223,7 +243,11 @@ fn cosine_similarity(lhs: &HashMap<String, f32>, rhs: &HashMap<String, f32>) -> 
 }
 
 fn limit_words(text: &str, max_words: usize) -> String {
-    words(text).into_iter().take(max_words).collect::<Vec<_>>().join(" ")
+    words(text)
+        .into_iter()
+        .take(max_words)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn sentence_case(text: &str) -> String {
@@ -251,8 +275,8 @@ fn keyword_priority(word: &str) -> usize {
     match word {
         "secret" | "truth" | "mistake" | "crazy" | "never" | "best" | "worst" | "exposed"
         | "hack" | "warning" | "proof" | "viral" | "million" | "money" | "insane" => 3,
-        "why" | "how" | "what" | "when" | "wait" | "because" | "before" | "after"
-        | "finally" | "actually" | "everyone" => 2,
+        "why" | "how" | "what" | "when" | "wait" | "because" | "before" | "after" | "finally"
+        | "actually" | "everyone" => 2,
         _ => usize::from(word.chars().any(|ch| ch.is_ascii_digit())),
     }
 }
@@ -260,8 +284,7 @@ fn keyword_priority(word: &str) -> usize {
 fn stopword(word: &str) -> bool {
     matches!(
         word,
-        "a"
-            | "an"
+        "a" | "an"
             | "and"
             | "are"
             | "as"
@@ -331,7 +354,10 @@ fn semantic_phrase_weight(text: &str) -> f32 {
         "turns out",
         "you need to",
     ];
-    phrases.iter().filter(|phrase| lower.contains(**phrase)).count() as f32
+    phrases
+        .iter()
+        .filter(|phrase| lower.contains(**phrase))
+        .count() as f32
 }
 
 fn build_segment_centroid(transcript_segments: &[String]) -> HashMap<String, f32> {
@@ -369,7 +395,10 @@ fn build_segment_centroid(transcript_segments: &[String]) -> HashMap<String, f32
     centroid
 }
 
-fn local_embedding_rerank(transcript_segments: &[String], clips: &[AiClipContext]) -> Vec<RerankResult> {
+fn local_embedding_rerank(
+    transcript_segments: &[String],
+    clips: &[AiClipContext],
+) -> Vec<RerankResult> {
     let centroid = build_segment_centroid(transcript_segments);
     let mut results = clips
         .iter()
@@ -399,7 +428,11 @@ fn local_embedding_rerank(transcript_segments: &[String], clips: &[AiClipContext
         })
         .collect::<Vec<_>>();
 
-    results.sort_by(|lhs, rhs| rhs.score.partial_cmp(&lhs.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|lhs, rhs| {
+        rhs.score
+            .partial_cmp(&lhs.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 
@@ -434,7 +467,11 @@ fn pick_thumbnail_text(clip: &AiClipContext, fallback: &str) -> String {
 }
 
 fn platform_caption(base: &str, tags: &str, fallback: &str) -> String {
-    let chosen = if base.trim().is_empty() { fallback } else { base };
+    let chosen = if base.trim().is_empty() {
+        fallback
+    } else {
+        base
+    };
     format!("{} {}", limit_words(chosen, 14), tags)
 }
 
@@ -503,7 +540,11 @@ fn heuristic_storyboard(options: &AiOptions, clips: &[AiClipContext]) -> AiStory
                 subtitle_preset: options.subtitle_preset.clone(),
                 thumbnail_text,
                 call_to_action: call_to_action.clone(),
-                youtube_shorts_caption: platform_caption(&excerpt, "#shorts #creator", "Big moment."),
+                youtube_shorts_caption: platform_caption(
+                    &excerpt,
+                    "#shorts #creator",
+                    "Big moment.",
+                ),
                 tiktok_caption: platform_caption(&excerpt, "#fyp #viral", "Wait for it."),
                 instagram_reels_caption: platform_caption(
                     &excerpt,
@@ -521,10 +562,18 @@ fn heuristic_storyboard(options: &AiOptions, clips: &[AiClipContext]) -> AiStory
     }
 }
 
-fn cloud_rerank(options: &AiOptions, transcript_segments: &[String], clips: &[AiClipContext]) -> Result<Vec<RerankResult>> {
+fn cloud_rerank(
+    options: &AiOptions,
+    transcript_segments: &[String],
+    clips: &[AiClipContext],
+) -> Result<Vec<RerankResult>> {
     let api_key = std::env::var(&options.api_key_env)
         .with_context(|| format!("missing API key env var {}", options.api_key_env))?;
-    let transcript_segments = transcript_segments.iter().take(12).cloned().collect::<Vec<_>>();
+    let transcript_segments = transcript_segments
+        .iter()
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
     let prompt = "Return strict JSON with shape {\"scores\":[{\"clip_id\":1,\"score\":0.0,\"reason\":\"...\"}]}. Score each candidate between 0 and 1 for semantic short-form potential using transcript payoff, clarity, face presence, and creator hook strength. Prefer clips with quotable statements, contrast, reveal, or direct viewer relevance.";
 
     let payload = match options.provider.as_str() {
@@ -573,7 +622,10 @@ fn cloud_rerank(options: &AiOptions, transcript_segments: &[String], clips: &[Ai
         provider if is_openai_compatible_provider(provider) || provider == "anthropic" => {
             let url = provider_chat_url(options, &api_key)?;
             let headers = provider_headers(options, &api_key);
-            let header_refs = headers.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>();
+            let header_refs = headers
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect::<Vec<_>>();
             run_curl_json(&url, &header_refs, &payload)?
         }
         "gemini" => run_curl_json(&provider_chat_url(options, &api_key)?, &[], &payload)?,
@@ -621,7 +673,10 @@ fn cloud_storyboard(options: &AiOptions, clips: &[AiClipContext]) -> Result<AiSt
         provider if is_openai_compatible_provider(provider) || provider == "anthropic" => {
             let url = provider_chat_url(options, &api_key)?;
             let headers = provider_headers(options, &api_key);
-            let header_refs = headers.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>();
+            let header_refs = headers
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect::<Vec<_>>();
             run_curl_json(&url, &header_refs, &payload)?
         }
         "gemini" => run_curl_json(&provider_chat_url(options, &api_key)?, &[], &payload)?,
@@ -631,28 +686,37 @@ fn cloud_storyboard(options: &AiOptions, clips: &[AiClipContext]) -> Result<AiSt
     parse_cloud_storyboard(options, response)
 }
 
-fn run_curl_json(url: &str, headers: &[(&str, &str)], payload: &serde_json::Value) -> Result<serde_json::Value> {
+fn run_curl_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let curl = which::which("curl").context("curl not found in PATH")?;
     let mut cmd = Command::new(curl);
-    cmd.arg("-sS").arg(url).arg("-H").arg("Content-Type: application/json");
+    cmd.arg("-sS")
+        .arg("-f")
+        .arg(url)
+        .arg("-H")
+        .arg("Content-Type: application/json");
     for (name, value) in headers {
         cmd.arg("-H").arg(format!("{name}: {value}"));
     }
     cmd.arg("-d").arg(payload.to_string());
 
-    let output = cmd.output().context("running curl for AI provider")?;
-    if !output.status.success() {
-        anyhow::bail!("curl AI request failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
+    let output = command_output_checked(&mut cmd, "running curl for AI provider")?;
 
     serde_json::from_slice(&output.stdout).context("parse AI provider json response")
 }
 
-fn parse_cloud_storyboard(options: &AiOptions, response: serde_json::Value) -> Result<AiStoryboard> {
+fn parse_cloud_storyboard(
+    options: &AiOptions,
+    response: serde_json::Value,
+) -> Result<AiStoryboard> {
     let raw = parse_cloud_content(options, response)?;
 
     let parsed: serde_json::Value = serde_json::from_str(&raw).context("parse AI content json")?;
-    let clips: Vec<AiClipPlan> = serde_json::from_value(parsed["clips"].clone()).context("parse AI clip plans")?;
+    let clips: Vec<AiClipPlan> =
+        serde_json::from_value(parsed["clips"].clone()).context("parse AI clip plans")?;
     Ok(AiStoryboard {
         provider: options.provider.clone(),
         model: options.model.clone(),
@@ -662,7 +726,8 @@ fn parse_cloud_storyboard(options: &AiOptions, response: serde_json::Value) -> R
 
 fn parse_cloud_content(options: &AiOptions, response: serde_json::Value) -> Result<String> {
     match options.provider.as_str() {
-        provider if is_openai_compatible_provider(provider) => response["choices"][0]["message"]["content"]
+        provider if is_openai_compatible_provider(provider) => response["choices"][0]["message"]
+            ["content"]
             .as_str()
             .context("missing OpenAI-compatible message content")
             .map(|value| value.to_string()),
@@ -678,7 +743,10 @@ fn parse_cloud_content(options: &AiOptions, response: serde_json::Value) -> Resu
     }
 }
 
-fn parse_cloud_rerank(options: &AiOptions, response: serde_json::Value) -> Result<Vec<RerankResult>> {
+fn parse_cloud_rerank(
+    options: &AiOptions,
+    response: serde_json::Value,
+) -> Result<Vec<RerankResult>> {
     let raw = parse_cloud_content(options, response)?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).context("parse rerank json")?;
     let mut scores: Vec<RerankResult> =
@@ -691,7 +759,9 @@ fn parse_cloud_rerank(options: &AiOptions, response: serde_json::Value) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{build_storyboard, pick_thumbnail_text, rerank_candidates, AiClipContext, AiOptions};
+    use super::{
+        build_storyboard, pick_thumbnail_text, rerank_candidates, AiClipContext, AiOptions,
+    };
 
     #[test]
     fn heuristic_storyboard_includes_platform_fields() {
